@@ -104,7 +104,9 @@ async def start_bot():
         setup_handlers(bot_app)
         await bot_app.initialize()
         await bot_app.start()
-        await bot_app.updater.start_polling(drop_pending_updates=True)
+        # drop_pending_updates=False: اگه پیام موقع ری‌استارت/آپدیت بیاد گم نشه
+        # (مثلاً کانفیگی که موقع دیپلوی Railway فرستاده می‌شه)
+        await bot_app.updater.start_polling(drop_pending_updates=False)
         logger.info("Telegram bot started.")
     except Exception as e:
         logger.error(f"Failed to start Telegram bot: {e}")

@@ -50,6 +50,18 @@ def _esc(s: str) -> str:
     return s
 
 
+NON_TESTABLE_SCHEMES = {"hysteria2", "hy2", "tuic", "ssr", "wireguard", "hysteria", "kcp"}
+
+
+def _count_non_testable(text: str) -> int:
+    """تعداد لینک‌های پروتکل‌هایی که قابل تست نیستن (فقط برای گزارش به کاربر)"""
+    count = 0
+    lower = text.lower()
+    for scheme in NON_TESTABLE_SCHEMES:
+        count += lower.count(scheme + "://")
+    return count
+
+
 async def _ensure_fixed_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دکمه‌های ثابت پایین چت: اولین بار که کاربر با ربات حرف می‌زنه میاد و
     بعدش همیشه پایین چت می‌مونه (تا وقتی عوضش نکنیم). یک بار در هر چت فرستاده می‌شه."""
@@ -941,6 +953,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # لینک‌ها رو برای دکمه‌های اکشن نگه می‌داریم
     context.user_data["last_extracted_links"] = links
 
+    skipped = _count_non_testable(text)
     lines = [
         f"✅ استخراج انجام شد",
         f"• پیدا شده: {len(links)}",
@@ -948,6 +961,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• تکراری: {dup_count}",
         f"• کل موجود در صف تست: {total_pending}",
     ]
+    if skipped:
+        lines.append(f"⚠️ {skipped} تا پروتکل غیرقابل‌تست (hysteria2/tuic/...) حذف شد")
     if source == "forward" and source_detail:
         lines.append(f"• منبع: فوروارد از {_esc(source_detail)}")
 
@@ -1424,7 +1439,25 @@ async def handle_fixed_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """هر خطایی در هر هندلر بیاد → به مدیر اصلی پیام بده تا بی‌سکوت نباشه"""
+    logger.exception("Handler error: %s", context.error)
+    try:
+        if settings.owner_id:
+            await context.bot.send_message(
+                chat_id=settings.owner_id,
+                text=(
+                    f"⚠️ خطا در ربات:\n`{type(context.error).__name__}: {str(context.error)[:300]}`\n\n"
+                    f"این پیام خودکاره تا بدونیم چیزی گیر کرده."
+                ),
+                parse_mode="Markdown",
+            )
+    except Exception:
+        pass
+
+
 def setup_handlers(application: Application):
+    application.add_error_handler(global_error_handler)
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("pending", cmd_pending))
