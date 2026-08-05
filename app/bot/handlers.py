@@ -40,6 +40,16 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+def _esc(s: str) -> str:
+    """فرار از کاراکترهای خاص Markdown (برای متن‌های کاربر/کانال که نباید کرش کنه)"""
+    if not s:
+        return ""
+    for ch in ("_", "*", "`", "[", "]"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
 # -------------------- آپدیت از فایل ZIP --------------------
 ZIP_MAX_SIZE = 10 * 1024 * 1024          # 10MB فایل zip
 ZIP_MAX_UNCOMPRESSED = 30 * 1024 * 1024  # حداکثر حجم کل بعد از باز شدن
@@ -661,10 +671,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Conversation handlers --------------------
 async def received_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
-    # ساده: فعلاً فقط ذخیره می‌کنیم
-    await db.add_channel(chat_id=text, title=text)
+    chat_id = text
+    title = text
+    username = ""
+
+    # resolve: سعی می‌کنیم آیدی واقعی کانال رو بگیریم (و ببینیم ربات دسترسی داره یا نه)
+    admin_warning = ""
+    try:
+        chat = await context.bot.get_chat(text)
+        if chat.id:
+            chat_id = str(chat.id)
+            title = chat.title or title
+            username = chat.username or ""
+        # چک کنیم ربات ادمین/عضو کاناله؟
+        bot_member = await context.bot.get_chat_member(chat_id, (await context.bot.get_me()).id)
+        status = bot_member.status
+        if status not in ("administrator", "creator", "member"):
+            admin_warning = (
+                f"\n\n⚠️ ربات فعلاً ادمین/عضو این کانال نیست!\n"
+                f"برای اینکه پست‌های کانال خودکار جمع بشن، ربات رو توی کانال ادمین کن."
+            )
+    except Exception:
+        # کانال خصوصیه یا دسترسی نیست — ذخیره می‌کنیم ولی هشدار می‌دیم
+        admin_warning = (
+            f"\n\n⚠️ نتونستم دسترسی ربات به کانال رو چک کنم.\n"
+            f"مطمئن شو ربات توی کانال ادمین شده (با حق دیدن پست‌ها)."
+        )
+
+    await db.add_channel(chat_id=chat_id, title=title, username=username)
     await update.effective_message.reply_text(
-        f"✅ کانال `{text}` اضافه شد.",
+        f"✅ کانال `{_esc(title)}` اضافه شد.\n"
+        f"آیدی عددی: `{chat_id}`"
+        + admin_warning,
         parse_mode="Markdown",
         reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
     )
@@ -899,7 +937,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• کل موجود در صف تست: {total_pending}",
     ]
     if source == "forward" and source_detail:
-        lines.append(f"• منبع: فوروارد از {source_detail}")
+        lines.append(f"• منبع: فوروارد از {_esc(source_detail)}")
 
     # نمایش چند تا نمونه
     samples = links[:3]
@@ -909,15 +947,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             info = parse_basic_info(s)
             proto = info.get("protocol") or "?"
             addr = info.get("address") or "?"
-            lines.append(f"• `{proto}` → `{addr}`")
+            lines.append(f"• `{_esc(proto)}` → `{_esc(addr)}`")
 
     lines.append("\n🎛 با دکمه‌های زیر انتخاب کن:")
 
-    await message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=extract_actions_keyboard(),
-    )
+    text_out = "\n".join(lines)
+    try:
+        await message.reply_text(text_out, parse_mode="Markdown", reply_markup=extract_actions_keyboard())
+    except Exception:
+        # اگه مارک‌داون خطا داد، بدون parse_mode بفرست که حتماً جواب برسه
+        await message.reply_text(text_out, reply_markup=extract_actions_keyboard())
 
 
 async def handle_update_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -955,6 +994,65 @@ async def handle_update_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=confirm_keyboard("confirm_update_zip", "back_main"),
     )
+
+
+@admin_only
+async def handle_media_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فوروارد/ارسال عکس، ویدیو و... که کانفیگ توی کپشنشونه.
+    (بیشتر کانال‌ها کانفیگ رو به‌صورت عکس با کپشن می‌فرستن — این هندلر اون‌ها رو می‌گیره)"""
+    message = update.effective_message
+    caption = message.caption or ""
+    if not caption.strip():
+        return
+
+    # اگه فایل/مستند هم هست، بذار هندلر فایل پردازشش کنه (فقط کپشن‌های رسانه)
+    if message.document is not None:
+        return
+
+    source = "forward" if message.forward_origin or message.forward_date else "message"
+    source_detail = ""
+    if message.forward_from_chat:
+        source_detail = message.forward_from_chat.title or str(message.forward_from_chat.id)
+    elif message.forward_from:
+        source_detail = message.forward_from.full_name or str(message.forward_from.id)
+
+    links = extract_from_message_text(caption)
+    if not links:
+        return
+
+    new_count, dup_count = await db.add_pending_configs(
+        links, source=source, source_detail=source_detail
+    )
+    total_pending = await db.count_pending()
+    context.user_data["last_extracted_links"] = links
+
+    lines = [
+        f"✅ استخراج از کپشن انجام شد",
+        f"• پیدا شده: {len(links)}",
+        f"• جدید: {new_count}",
+        f"• تکراری: {dup_count}",
+        f"• کل موجود در صف تست: {total_pending}",
+    ]
+    if source == "forward" and source_detail:
+        lines.append(f"• منبع: فوروارد از {_esc(source_detail)}")
+
+    # نمایش چند تا نمونه
+    samples = links[:3]
+    if samples:
+        lines.append("\nنمونه:")
+        for s in samples:
+            info = parse_basic_info(s)
+            proto = info.get("protocol") or "?"
+            addr = info.get("address") or "?"
+            lines.append(f"• `{_esc(proto)}` → `{_esc(addr)}`")
+
+    lines.append("\n🎛 با دکمه‌های زیر انتخاب کن:")
+
+    text_out = "\n".join(lines)
+    try:
+        await message.reply_text(text_out, parse_mode="Markdown", reply_markup=extract_actions_keyboard())
+    except Exception:
+        await message.reply_text(text_out, reply_markup=extract_actions_keyboard())
 
 
 @admin_only
@@ -1004,30 +1102,37 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ داخل فایل هیچ کانفیگ معتبری پیدا نشد.")
         return
 
+    # کپشن فایل هم اگه لینک داشته باشه اضافه می‌کنیم
+    cap_links = extract_from_message_text(message.caption or "")
+    all_links = links + [l for l in cap_links if l not in links]
+
     new_count, dup_count = await db.add_pending_configs(
-        links,
+        all_links,
         source="file",
         source_detail=doc.file_name or "document",
     )
     total_pending = await db.count_pending()
 
     # لینک‌ها رو برای دکمه‌های اکشن نگه می‌داریم
-    context.user_data["last_extracted_links"] = links
+    context.user_data["last_extracted_links"] = all_links
 
     text = (
         f"✅ فایل پردازش شد\n"
-        f"• نام فایل: `{doc.file_name}`\n"
-        f"• پیدا شده: {len(links)}\n"
+        f"• نام فایل: `{_esc(doc.file_name or '')}`\n"
+        f"• پیدا شده: {len(all_links)}\n"
         f"• جدید: {new_count}\n"
         f"• تکراری: {dup_count}\n"
         f"• کل موجود در صف تست: {total_pending}\n\n"
         f"🎛 با دکمه‌های زیر انتخاب کن:"
     )
-    await status_msg.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=extract_actions_keyboard(),
-    )
+    try:
+        await status_msg.edit_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=extract_actions_keyboard(),
+        )
+    except Exception:
+        await status_msg.edit_text(text, reply_markup=extract_actions_keyboard())
 
 
 async def received_remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1339,6 +1444,11 @@ def setup_handlers(application: Application):
         MessageHandler(
             filters.Text([b for b in FIXED_BUTTON_CMDS]), handle_fixed_button
         )
+    )
+
+    # فوروارد/ارسال عکس، ویدیو و... با کپشن حاوی کانفیگ
+    application.add_handler(
+        MessageHandler(filters.CAPTION & ~filters.ChatType.CHANNEL, handle_media_caption)
     )
 
     # ⚠️ پست‌های کانال باید اولین MessageHandler باشن!
