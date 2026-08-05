@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     test_timeout: int = 8                   # ثانیه
     keep_top_n: int = 20
     history_ttl_hours: int = 24
+    speed_test_enabled: bool = True         # تست سرعت دانلود (رد سرورهای خیلی کند)
+    min_speed_kbps: int = 50                # حداقل سرعت قبول (کیلوبیت بر ثانیه)
 
     # Paths
     db_path: Path = DATA_DIR / "bot.db"

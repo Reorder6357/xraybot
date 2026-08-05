@@ -40,6 +40,7 @@ class RunResult:
         self.output_lines: list[str] = []
         self.duration_sec = 0.0
         self.error: str = ""
+        self.cancelled = False
 
 
 async def run_full_test(
@@ -47,6 +48,7 @@ async def run_full_test(
     concurrency: int | None = None,
     keep_top: int | None = None,
     progress_callback: Optional[Callable] = None,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> RunResult:
     """
     یک دوره کامل تست را اجرا می‌کند.
@@ -64,7 +66,7 @@ async def run_full_test(
 
     async with _run_lock:
         return await _run_locked(
-            result, max_configs, concurrency, keep_top, progress_callback, t0
+            result, max_configs, concurrency, keep_top, progress_callback, cancel_event, t0
         )
 
 
@@ -74,6 +76,7 @@ async def _run_locked(
     concurrency: int,
     keep_top: int,
     progress_callback: Optional[Callable],
+    cancel_event: Optional[asyncio.Event],
     t0: float,
 ) -> RunResult:
     try:
@@ -109,7 +112,11 @@ async def _run_locked(
             concurrency=concurrency,
             timeout=float(settings.test_timeout),
             progress_callback=_progress,
+            cancel_event=cancel_event,
         )
+
+        if cancel_event and cancel_event.is_set():
+            result.cancelled = True
 
         result.tested = len(test_results)
         result.success = sum(1 for r in test_results if r.success)
@@ -120,7 +127,10 @@ async def _run_locked(
         result.top = top
 
         if not top:
-            result.error = "هیچ کانفیگ سالمی پیدا نشد"
+            if result.cancelled:
+                result.error = "متوقف شد (نتیجه‌ای نیامد)"
+            else:
+                result.error = "هیچ کانفیگ سالمی پیدا نشد"
             result.duration_sec = time.perf_counter() - t0
             return result
 
@@ -159,9 +169,10 @@ async def _run_locked(
         # ۸. پاکسازی صف: کانفیگ‌های این دوره (موفق + ناموفق) از صف حذف می‌شن.
         #     اینطوری صف همیشه «تست‌نشده»هاست و هر بار همه‌چیز دوباره تست نمی‌شه؛
         #     کانفیگ‌های سالم تا ۲۴ ساعت توی history هستن و ساب‌ها هم هر دوره دوباره جمع می‌شن.
-        if links:
+        tested_links = [r.link for r in test_results] if 'test_results' in dir() else []
+        if tested_links:
             try:
-                await db.delete_pending_by_hashes([config_hash(l) for l in links])
+                await db.delete_pending_by_hashes([config_hash(l) for l in tested_links])
             except Exception as e:
                 logger.warning(f"Failed to clean pending queue: {e}")
 

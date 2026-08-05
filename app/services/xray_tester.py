@@ -86,15 +86,16 @@ class TestResult:
     error: str = ""
     protocol: str = ""
     address: str = ""
+    speed_kbps: float = 0.0
 
     @property
     def flag(self) -> str:
         return COUNTRY_FLAGS.get(self.country_code.upper(), "🏳️")
 
     def make_remark(self, channel_tag: str = "", tag_enabled: bool = False) -> str:
+        """ریمارک: فقط پرچم + کشور (بدون latency).
+        تگ کانال فقط اگه روشن باشه اضافه می‌شه."""
         base = f"{self.flag} {self.country_name or self.country_code or 'Unknown'}"
-        if self.latency_ms > 0:
-            base += f" | {int(self.latency_ms)}ms"
         if tag_enabled and channel_tag:
             tag = channel_tag if channel_tag.startswith("@") else f"@{channel_tag}"
             base += f" | {tag}"
@@ -391,6 +392,10 @@ EGRESS_TARGETS = [
     "https://api.ipify.org?format=json",
 ]
 
+# تست سرعت: دانلود 256KB از کلادفلر (اندازه‌گیری پهنای باند واقعی تونل)
+SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=262144"
+SPEED_TEST_BYTES = 262144
+
 
 def _parse_cf_trace(text: str) -> tuple[str, str]:
     """پارس کردن پاسخ cdn-cgi/trace: (ip, loc)"""
@@ -413,14 +418,14 @@ async def _find_free_port() -> int:
 async def test_one_config(
     link: str,
     timeout: float = 8.0,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> TestResult:
     """
     تست سختگیرانه یک کانفیگ:
       ۱) تونل تا سرور برقرار شود و پاسخ HTTP معتبر (۲۰۰/۲۰۴) برگردد
       ۲) ترافیک واقعاً به اینترنت خروجی داشته باشد (IP خروجی قابل تأیید)
-    فقط وقتی هر دو مرحله پاس شود، کانفیگ «سالم» حساب می‌شود.
-    (قبل از این فیکس، هر پاسخ HTTP — حتی صفحه خطای ۵۰۲ از پنل/CDN —
-     سالم حساب می‌شد و سرورهای مرده بالای لیست می‌آمدند.)
+      ۳) (اختیاری) تست سرعت دانلود — اگه خیلی کند باشه رد می‌شه
+    فقط وقتی همه مراحل پاس شود، کانفیگ «سالم» حساب می‌شود.
     """
     info = parse_basic_info(link)
     result = TestResult(
@@ -473,6 +478,9 @@ async def test_one_config(
             stage_ok = False
             last_err = "connect_failed"
             for url, ok_codes in CONNECTIVITY_TARGETS:
+                if cancel_event and cancel_event.is_set():
+                    result.error = "cancelled"
+                    return result
                 start = time.perf_counter()
                 try:
                     resp = await client.get(url)
@@ -492,6 +500,9 @@ async def test_one_config(
             # ---- مرحله ۲: راستی‌آزمایی خروجی واقعی (IP + کشور) ----
             egress_ok = False
             for url in EGRESS_TARGETS:
+                if cancel_event and cancel_event.is_set():
+                    result.error = "cancelled"
+                    return result
                 try:
                     resp = await client.get(url)
                     if resp.status_code != 200:
@@ -516,6 +527,29 @@ async def test_one_config(
             if not egress_ok:
                 result.error = "egress_failed (خروجی تأیید نشد)"
                 return result
+
+            # ---- مرحله ۳: تست سرعت (اگه فعال باشه) ----
+            min_kbps = int(getattr(settings, "min_speed_kbps", 50) or 0)
+            if getattr(settings, "speed_test_enabled", True) and min_kbps > 0:
+                if cancel_event and cancel_event.is_set():
+                    result.error = "cancelled"
+                    return result
+                try:
+                    start = time.perf_counter()
+                    size = 0
+                    async with client.stream("GET", SPEED_TEST_URL) as sr:
+                        async for chunk in sr.aiter_bytes():
+                            size += len(chunk)
+                            if size >= SPEED_TEST_BYTES:
+                                break
+                    dur = time.perf_counter() - start
+                    kbps = (size * 8 / 1024) / dur if dur > 0 else 0
+                    result.speed_kbps = round(kbps, 1)
+                    if kbps < min_kbps:
+                        result.error = f"slow_server ({int(kbps)}KB/s)"
+                        return result
+                except Exception:
+                    pass  # سرعت نگرفتیم؛ fail نمی‌کنیم (شاید سرور دانلود رو بسته باشه)
 
         result.success = True
         return result
@@ -544,9 +578,12 @@ async def test_batch(
     concurrency: int = 20,
     timeout: float = 8.0,
     progress_callback=None,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> list[TestResult]:
     """
     تست موازی لیست کانفیگ‌ها با محدودیت concurrency.
+    اگه cancel_event ست بشه، تست‌های شروع‌نشده رد می‌شن و
+    نتیجه تا اون لحظه برمی‌گرده.
     """
     sem = asyncio.Semaphore(concurrency)
     results: list[TestResult] = []
@@ -556,10 +593,12 @@ async def test_batch(
     async def worker(link: str):
         nonlocal done
         async with sem:
-            res = await test_one_config(link, timeout=timeout)
+            if cancel_event and cancel_event.is_set():
+                return  # تست جدید شروع نکن
+            res = await test_one_config(link, timeout=timeout, cancel_event=cancel_event)
             results.append(res)
             done += 1
-            if progress_callback and (done % 10 == 0 or done == total):
+            if progress_callback and (done % 5 == 0 or done == total):
                 try:
                     await progress_callback(done, total, res)
                 except Exception:

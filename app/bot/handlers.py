@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import zipfile
-from telegram import Update
+from telegram import Update, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,7 +23,8 @@ from app.core.config import settings, DATA_DIR
 from app.core.database import db
 from app.bot.keyboards import (
     main_menu, channels_menu, subs_menu, tag_menu,
-    schedule_menu, settings_menu, github_menu, back_only, confirm_keyboard
+    schedule_menu, settings_menu, github_menu, back_only, confirm_keyboard,
+    queue_menu, personal_menu, extract_actions_keyboard, cancel_run_keyboard, fixed_menu,
 )
 from app.services.github_deploy import github_deployer
 from app.services.config_extractor import (
@@ -30,7 +32,8 @@ from app.services.config_extractor import (
     extract_from_document,
     parse_basic_info,
 )
-from app.services.runner import run_full_test
+from app.services.runner import run_full_test, _run_lock
+from app.services.xray_tester import test_batch, select_top, TestResult
 from app.services.scheduler import reload_schedule
 from app.services.collector import collect_from_subscriptions, collect_all
 from pathlib import Path
@@ -149,7 +152,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ربات مدیریت و تست کانفیگ‌های Xray آماده‌ست.\n"
         "از دکمه‌های زیر استفاده کن:"
     )
-    await update.effective_message.reply_text(text, reply_markup=main_menu(is_owner))
+    await update.effective_message.reply_text(
+        text, reply_markup=main_menu(is_owner)
+    )
+    # دکمه‌های ثابت پایین چت
+    try:
+        await update.effective_message.reply_text(
+            "⌨️ دکمه‌های سریع:", reply_markup=fixed_menu()
+        )
+    except Exception:
+        pass
 
 
 # -------------------- Callback router --------------------
@@ -415,6 +427,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"این کار ممکنه چند دقیقه طول بکشه."
         )
 
+        cancel_event = asyncio.Event()
+        context.bot_data["cancel_event"] = cancel_event
+
         async def progress(done, total, last_res):
             try:
                 mark = "✅" if last_res.success else "❌"
@@ -422,32 +437,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⏳ در حال تست...\n"
                     f"• پیشرفت: {done}/{total}\n"
                     f"• آخرین: {mark} {last_res.address or '?'} "
-                    f"({int(last_res.latency_ms) if last_res.success else last_res.error[:30]})"
+                    f"({int(last_res.latency_ms) if last_res.success else last_res.error[:30]})\n"
+                    f"برای توقف، دکمه پایین رو بزن.",
+                    reply_markup=cancel_run_keyboard(),
                 )
             except Exception:
                 pass
 
-        run = await run_full_test(progress_callback=progress)
+        try:
+            run = await run_full_test(progress_callback=progress, cancel_event=cancel_event)
+        finally:
+            context.bot_data.pop("cancel_event", None)
 
-        if run.error and not run.top:
+        if run.cancelled and not run.top:
             await status.edit_text(
-                f"❌ {run.error}\n"
-                f"⏱ زمان: {run.duration_sec}s",
+                f"⛔ تست متوقف شد — نتیجه‌ای نیامد.\n⏱ زمان: {run.duration_sec}s",
                 reply_markup=back_only(),
             )
             return
 
+        if run.error and not run.top:
+            await status.edit_text(
+                f"❌ {run.error}\n⏱ زمان: {run.duration_sec}s",
+                reply_markup=back_only(),
+            )
+            return
+
+        head = "⛔ متوقف شد — نتیجه تا این لحظه:" if run.cancelled else "✅ تست تموم شد"
         summary = (
-            f"✅ تست تموم شد\n\n"
-            f"• ورودی: {run.total_input}\n"
-            f"• رد شده (تکراری ۲۴س): {run.skipped_recent}\n"
-            f"• تست‌شده: {run.tested}\n"
-            f"• سالم: {run.success}\n"
-            f"• ناموفق: {run.failed}\n"
-            f"• انتخاب‌شده (top): {len(run.top)}\n"
-            f"⏱ زمان: {run.duration_sec}s"
+            f"{head}\n\n• ورودی: {run.total_input}\n• رد شده (تکراری ۲۴س): {run.skipped_recent}\n• تست‌شده: {run.tested}\n• سالم: {run.success}\n• ناموفق: {run.failed}\n• انتخاب‌شده (top): {len(run.top)}\n⏱ زمان: {run.duration_sec}s"
         )
         await status.edit_text(summary)
+
 
         if run.output_file and run.output_file.exists():
             await context.bot.send_document(
@@ -461,6 +482,147 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="منوی اصلی:",
             reply_markup=main_menu(is_owner),
         )
+        return
+
+    # ---- Queue section ----
+    if data == "menu_queue":
+        count = await db.count_pending()
+        await query.edit_message_text(
+            f"📦 مدیریت صف تست\nدر صف: `{count}` کانفیگ",
+            parse_mode="Markdown",
+            reply_markup=queue_menu(),
+        )
+        return
+
+    if data == "view_queue":
+        rows = await db.get_pending_configs(limit=10)
+        count = await db.count_pending()
+        if not rows:
+            text = "📦 صف خالیه."
+        else:
+            lines = [f"📦 کل صف: {count} | نمایش ۱۰ تای اول:", ""]
+            for r in rows:
+                lines.append(f"• `{r['protocol'] or '?'}` → `{r['address'] or '?'}` ({r['source']})")
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=queue_menu(),
+        )
+        return
+
+    if data == "clear_queue":
+        await query.edit_message_text(
+            "🗑 کل صف تست پاک بشه؟ (کانفیگ‌های سالمِ ارسال‌شده توی تاریخچه می‌مونن)",
+            reply_markup=confirm_keyboard("confirm_clear_queue", "menu_queue"),
+        )
+        return
+
+    if data == "confirm_clear_queue":
+        await db.clear_pending()
+        await query.edit_message_text(
+            "🗑 صف تست پاک شد.",
+            reply_markup=queue_menu(),
+        )
+        return
+
+    # ---- Personal section ----
+    if data == "menu_personal":
+        count = await db.count_personal()
+        await query.edit_message_text(
+            f"👤 بخش شخصی\nکانفیگ ذخیره‌شده: `{count}`",
+            parse_mode="Markdown",
+            reply_markup=personal_menu(),
+        )
+        return
+
+    if data == "personal_list":
+        rows = await db.list_personal(limit=20)
+        count = await db.count_personal()
+        if not rows:
+            text = "👤 شخصی خالیه. بعد از فرستادن کانفیگ، دکمه «ذخیره در شخصی» رو بزن."
+        else:
+            lines = [f"👤 {count} کانفیگ (۲۰ تای اول):", ""]
+            for i, r in enumerate(rows, 1):
+                lines.append(f"{i}. `{r['config_line'][:70]}...`")
+            text = "\n".join(lines)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=personal_menu())
+        return
+
+    if data == "personal_test":
+        rows = await db.list_personal()
+        if not rows:
+            await query.edit_message_text("👤 شخصی خالیه.", reply_markup=personal_menu())
+            return
+        links = [r["config_line"] for r in rows]
+        await query.edit_message_text(f"👤 تست {len(links)} کانفیگ شخصی...")
+        await _run_manual_test(update, context, links, title="تست بخش شخصی")
+        return
+
+    if data == "personal_clear":
+        await query.edit_message_text(
+            "🗑 کل بخش شخصی پاک بشه؟",
+            reply_markup=confirm_keyboard("confirm_personal_clear", "menu_personal"),
+        )
+        return
+
+    if data == "confirm_personal_clear":
+        await db.clear_personal()
+        await query.edit_message_text("🗑 بخش شخصی پاک شد.", reply_markup=personal_menu())
+        return
+
+    # ---- Actions on extracted configs ----
+    if data == "act_test_now":
+        links = context.user_data.pop("last_extracted_links", None)
+        if not links:
+            await query.answer("اول یه کانفیگ بفرست", show_alert=True)
+            return
+        await _run_manual_test(update, context, links, title="تست کانفیگ‌های ارسال‌شده")
+        return
+
+    if data == "act_save_personal":
+        links = (
+            context.user_data.pop("last_extracted_links", None)
+            or context.user_data.pop("last_success_links", None)
+        )
+        if not links:
+            await query.answer("چیزی برای ذخیره نیست", show_alert=True)
+            return
+        new_count, dup_count = await db.add_personal_configs(links)
+        from app.services.config_extractor import config_hash
+        await db.delete_pending_by_hashes([config_hash(l) for l in links])
+        await query.edit_message_text(
+            f"👤 ذخیره شد در شخصی: {new_count} جدید، {dup_count} تکراری\n(از صف تست هم حذف شد)",
+            reply_markup=personal_menu(),
+        )
+        return
+
+    if data == "act_remove_queue":
+        links = context.user_data.pop("last_extracted_links", None)
+        if not links:
+            await query.answer("چیزی برای حذف نیست", show_alert=True)
+            return
+        from app.services.config_extractor import config_hash
+        await db.delete_pending_by_hashes([config_hash(l) for l in links])
+        await query.edit_message_text(
+            f"🗑 {len(links)} کانفیگ از صف حذف شد.",
+            reply_markup=main_menu(is_owner),
+        )
+        return
+
+    if data == "act_cancel_run":
+        ev = context.bot_data.get("cancel_event")
+        if ev:
+            ev.set()
+            await query.answer("⏹ در حال توقف تست...", show_alert=False)
+            try:
+                await query.edit_message_text(
+                    "⏹ در حال توقف... نتیجه تا این لحظه ارسال می‌شه.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("تستی در حال اجرا نیست")
         return
 
     if data == "last_output":
@@ -592,6 +754,104 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# -------------------- تست دستی (تک‌سرور یا گروه کوچک) --------------------
+
+async def _run_manual_test(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    links: list[str],
+    title: str = "تست دستی",
+):
+    """تست سریع چند لینک با دکمه توقف. نتیجه تا لحظه توقف ارسال می‌شه."""
+    if _run_lock.locked():
+        await update.effective_message.reply_text(
+            "⏳ الان یک تست دیگه در حال اجراست؛ چند لحظه صبر کن.",
+            reply_markup=back_only(),
+        )
+        return
+
+    status = await update.effective_message.reply_text(
+        f"⏳ {title}: {len(links)} کانفیگ\n"
+        f"برای توقف، دکمه پایین رو بزن.",
+        reply_markup=cancel_run_keyboard(),
+    )
+
+    cancel_event = asyncio.Event()
+    context.bot_data["cancel_event"] = cancel_event
+
+    async def progress(done, total, last_res):
+        try:
+            mark = "✅" if last_res.success else "❌"
+            extra = f" ({int(last_res.latency_ms)}ms)" if last_res.success else ""
+            await status.edit_text(
+                f"⏳ در حال تست...\n• پیشرفت: {done}/{total}\n"
+                f"• آخرین: {mark} {last_res.address or '?'}{extra}",
+                reply_markup=cancel_run_keyboard(),
+            )
+        except Exception:
+            pass
+
+    try:
+        results = await test_batch(
+            links,
+            concurrency=min(settings.test_concurrency, max(5, len(links))),
+            timeout=float(settings.test_timeout),
+            progress_callback=progress,
+            cancel_event=cancel_event,
+        )
+    finally:
+        context.bot_data.pop("cancel_event", None)
+
+    ok = [r for r in results if r.success]
+    cancelled = cancel_event.is_set()
+
+    lines = [f"{'⛔ متوقف شد — نتیجه تا این لحظه:' if cancelled else '✅ تست تموم شد:'}"]
+    for r in results[:30]:
+        if r.success:
+            spd = f" | {int(r.speed_kbps)}KB/s" if r.speed_kbps else ""
+            lines.append(f"✅ {r.flag} {r.country_name or r.country_code} | {int(r.latency_ms)}ms{spd} | {r.address}")
+        else:
+            lines.append(f"❌ {r.address or '?'} — {r.error[:40]}")
+    if len(results) > 30:
+        lines.append(f"… و {len(results) - 30} مورد دیگر")
+
+    text = "\n".join(lines)
+    kb = None
+    if ok:
+        text += f"\n\n🎯 {len(ok)} مورد از {len(results)} سالم."
+        context.user_data["last_success_links"] = [r.link for r in ok]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 ذخیره سالم‌ها در شخصی", callback_data="act_save_personal")],
+        ])
+
+    try:
+        await status.edit_text(text, reply_markup=kb)
+    except Exception:
+        await update.effective_message.reply_text(text, reply_markup=kb)
+
+    if ok:
+        remark_lines = [r.with_new_remark() for r in ok]
+        if len(remark_lines) <= 15:
+            await update.effective_message.reply_text(
+                "📄 کانفیگ‌های سالم:\n\n" + "\n".join(remark_lines),
+                reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+            )
+        else:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="healthy_")
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(remark_lines) + "\n")
+            await update.effective_message.reply_document(
+                document=open(tmp, "rb"),
+                filename="healthy_manual.txt",
+                caption=f"📄 {len(remark_lines)} کانفیگ سالم",
+            )
+    else:
+        await update.effective_message.reply_text(
+            "منوی اصلی:", reply_markup=main_menu(settings.is_owner(update.effective_user.id))
+        )
+
+
 # -------------------- استخراج کانفیگ از پیام / فایل / فوروارد --------------------
 
 @admin_only
@@ -628,6 +888,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     total_pending = await db.count_pending()
 
+    # لینک‌ها رو برای دکمه‌های اکشن نگه می‌داریم
+    context.user_data["last_extracted_links"] = links
+
     lines = [
         f"✅ استخراج انجام شد",
         f"• پیدا شده: {len(links)}",
@@ -648,10 +911,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             addr = info.get("address") or "?"
             lines.append(f"• `{proto}` → `{addr}`")
 
+    lines.append("\n🎛 با دکمه‌های زیر انتخاب کن:")
+
     await message.reply_text(
         "\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+        reply_markup=extract_actions_keyboard(),
     )
 
 
@@ -746,18 +1011,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     total_pending = await db.count_pending()
 
+    # لینک‌ها رو برای دکمه‌های اکشن نگه می‌داریم
+    context.user_data["last_extracted_links"] = links
+
     text = (
         f"✅ فایل پردازش شد\n"
         f"• نام فایل: `{doc.file_name}`\n"
         f"• پیدا شده: {len(links)}\n"
         f"• جدید: {new_count}\n"
         f"• تکراری: {dup_count}\n"
-        f"• کل موجود در صف تست: {total_pending}"
+        f"• کل موجود در صف تست: {total_pending}\n\n"
+        f"🎛 با دکمه‌های زیر انتخاب کن:"
     )
     await status_msg.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+        reply_markup=extract_actions_keyboard(),
     )
 
 
@@ -833,6 +1102,100 @@ async def received_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اجرای تست کل صف (معادل دکمه اجرای دستی)"""
+    msg = update.effective_message
+    status = await msg.reply_text("🔄 آماده‌سازی...", reply_markup=fixed_menu())
+    try:
+        sub_new = await collect_from_subscriptions()
+    except Exception:
+        sub_new = 0
+
+    pending = await db.count_pending()
+    if pending == 0:
+        await status.edit_text(
+            "📦 صف خالیه. اول چند تا کانفیگ بفرست یا ساب اضافه کن.",
+            reply_markup=back_only(),
+        )
+        return
+
+    await status.edit_text(
+        f"⏳ شروع تست...\n"
+        f"• کانفیگ جدید از ساب: {sub_new}\n"
+        f"• تعداد در صف: {pending}\n"
+        f"این کار ممکنه چند دقیقه طول بکشه."
+    )
+
+    cancel_event = asyncio.Event()
+    context.bot_data["cancel_event"] = cancel_event
+
+    async def progress(done, total, last_res):
+        try:
+            mark = "✅" if last_res.success else "❌"
+            await status.edit_text(
+                f"⏳ در حال تست...\n• پیشرفت: {done}/{total}\n"
+                f"• آخرین: {mark} {last_res.address or '?'} "
+                f"({int(last_res.latency_ms) if last_res.success else last_res.error[:30]})\n"
+                f"برای توقف، دکمه پایین رو بزن.",
+                reply_markup=cancel_run_keyboard(),
+            )
+        except Exception:
+            pass
+
+    try:
+        run = await run_full_test(progress_callback=progress, cancel_event=cancel_event)
+    finally:
+        context.bot_data.pop("cancel_event", None)
+
+    if run.cancelled and not run.top:
+        await status.edit_text(
+            f"⛔ تست متوقف شد — نتیجه‌ای نیامد.\n⏱ زمان: {run.duration_sec}s",
+            reply_markup=back_only(),
+        )
+        return
+    if run.error and not run.top:
+        await status.edit_text(f"❌ {run.error}\n⏱ زمان: {run.duration_sec}s", reply_markup=back_only())
+        return
+
+    head = "⛔ متوقف شد — نتیجه تا این لحظه:" if run.cancelled else "✅ تست تموم شد"
+    summary = (
+        f"{head}\n\n"
+        f"• ورودی: {run.total_input}\n"
+        f"• رد شده (تکراری ۲۴س): {run.skipped_recent}\n"
+        f"• تست‌شده: {run.tested}\n"
+        f"• سالم: {run.success}\n"
+        f"• ناموفق: {run.failed}\n"
+        f"• انتخاب‌شده (top): {len(run.top)}\n"
+        f"⏱ زمان: {run.duration_sec}s"
+    )
+    await status.edit_text(summary)
+
+    if run.output_file and run.output_file.exists():
+        await context.bot.send_document(
+            chat_id=msg.chat_id,
+            document=run.output_file.open("rb"),
+            filename=run.output_file.name,
+            caption=f"📄 {len(run.output_lines)} کانفیگ سالم",
+        )
+    await context.bot.send_message(
+        chat_id=msg.chat_id,
+        text="منوی اصلی:",
+        reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+    )
+
+
+@admin_only
+async def cmd_personal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی بخش شخصی"""
+    count = await db.count_personal()
+    await update.effective_message.reply_text(
+        f"👤 بخش شخصی\n\nکانفیگ ذخیره‌شده: `{count}`",
+        parse_mode="Markdown",
+        reply_markup=personal_menu(),
+    )
+
+
+@admin_only
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """نمایش تعداد کانفیگ‌های در صف"""
     count = await db.count_pending()
@@ -904,11 +1267,50 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
 
 
+FIXED_BUTTON_CMDS = {
+    "🏠 منو": "start",
+    "⚡ اجرای تست": "run",
+    "⛔ لغو": "cancel",
+    "📦 صف تست": "pending",
+    "👤 شخصی": "personal",
+    "🚀 دیپلوی": "menu_github",
+}
+
+
+async def handle_fixed_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دکمه‌های ثابت پایین چت → تبدیل به دستور"""
+    text = (update.effective_message.text or "").strip()
+    cmd = FIXED_BUTTON_CMDS.get(text)
+    if not cmd:
+        return
+    if cmd == "start":
+        await cmd_start(update, context)
+    elif cmd == "run":
+        await cmd_run(update, context)
+    elif cmd == "cancel":
+        await cancel(update, context)
+    elif cmd == "pending":
+        await cmd_pending(update, context)
+    elif cmd == "personal":
+        await cmd_personal(update, context)
+    elif cmd == "menu_github":
+        if not settings.is_owner(update.effective_user.id):
+            await update.effective_message.reply_text("⛔ فقط مدیر اصلی")
+            return
+        status = await github_deployer.get_status()
+        await update.effective_message.reply_text(
+            f"مدیریت دیپلوی گیت‌هاب\n\n{status}",
+            reply_markup=github_menu(),
+        )
+
+
 def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("pending", cmd_pending))
     application.add_handler(CommandHandler("clear_pending", cmd_clear_pending))
+    application.add_handler(CommandHandler("run", cmd_run))
+    application.add_handler(CommandHandler("personal", cmd_personal))
 
     # Conversation برای دریافت ورودی‌های منو (اولویت بالاتر)
     conv = ConversationHandler(
@@ -931,6 +1333,13 @@ def setup_handlers(application: Application):
 
     # callbackهای معمولی
     application.add_handler(CallbackQueryHandler(callback_router))
+
+    # دکمه‌های ثابت پایین چت
+    application.add_handler(
+        MessageHandler(
+            filters.Text([b for b in FIXED_BUTTON_CMDS]), handle_fixed_button
+        )
+    )
 
     # ⚠️ پست‌های کانال باید اولین MessageHandler باشن!
     # (اگه بعد از فیلتر TEXT ثبت بشن، پست کانال اول به handle_text_message می‌خوره

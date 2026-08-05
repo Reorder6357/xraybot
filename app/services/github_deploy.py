@@ -77,7 +77,8 @@ class GitHubDeployer:
             return False, "❌ توکن یا ریپوی گیت‌هاب تنظیم نشده. اول از دکمه «تنظیم گیت‌هاب» استفاده کن."
 
         try:
-            async def _do_deploy():
+            def _do_deploy():
+                # (سینکرون — توی thread جدا اجرا می‌شه)
                 # گرفتن آخرین کامیت شاخه اصلی
                 default_branch = self._repo.default_branch
                 ref = self._repo.get_git_ref(f"heads/{default_branch}")

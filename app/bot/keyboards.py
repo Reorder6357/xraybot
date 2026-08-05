@@ -1,11 +1,27 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
 
+def fixed_menu() -> ReplyKeyboardMarkup:
+    """دکمه‌های ثابت پایین چت (همیشه جلوی چشم کاربر)"""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🏠 منو"), KeyboardButton("⚡ اجرای تست"), KeyboardButton("⛔ لغو")],
+            [KeyboardButton("📦 صف تست"), KeyboardButton("👤 شخصی"), KeyboardButton("🚀 دیپلوی")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="کانفیگ بفرست یا از دکمه‌ها استفاده کن...",
+    )
+
+
 def main_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton("📡 کانال‌ها", callback_data="menu_channels"),
             InlineKeyboardButton("🔗 سابسکریپشن", callback_data="menu_subs"),
+        ],
+        [
+            InlineKeyboardButton("📦 صف تست", callback_data="menu_queue"),
+            InlineKeyboardButton("👤 شخصی", callback_data="menu_personal"),
         ],
         [
             InlineKeyboardButton("🏷️ تگ کانال", callback_data="menu_tag"),
@@ -24,6 +40,41 @@ def main_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🚀 دیپلوی گیت‌هاب", callback_data="menu_github"),
         ])
     return InlineKeyboardMarkup(buttons)
+
+
+def queue_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 مشاهده صف", callback_data="view_queue")],
+        [InlineKeyboardButton("🗑 پاک کردن کل صف", callback_data="clear_queue")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
+    ])
+
+
+def personal_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 لیست کانفیگ‌ها", callback_data="personal_list")],
+        [InlineKeyboardButton("⚡ تست همه", callback_data="personal_test")],
+        [InlineKeyboardButton("🗑 پاک کردن همه", callback_data="personal_clear")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
+    ])
+
+
+def extract_actions_keyboard() -> InlineKeyboardMarkup:
+    """دکمه‌های زیر پیام استخراج کانفیگ"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ تست همین الان", callback_data="act_test_now")],
+        [
+            InlineKeyboardButton("👤 ذخیره در شخصی", callback_data="act_save_personal"),
+            InlineKeyboardButton("🗑 حذف از صف", callback_data="act_remove_queue"),
+        ],
+    ])
+
+
+def cancel_run_keyboard() -> InlineKeyboardMarkup:
+    """دکمه توقف در حین تست"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⛔ توقف تست", callback_data="act_cancel_run")],
+    ])
 
 
 def channels_menu() -> InlineKeyboardMarkup:

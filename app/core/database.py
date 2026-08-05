@@ -71,6 +71,15 @@ class Database:
                 last_seen REAL
             );
 
+            -- کانفیگ‌های شخصی (بخش «شخصی» در ربات)
+            CREATE TABLE IF NOT EXISTS personal_configs (
+                config_hash TEXT PRIMARY KEY,
+                config_line TEXT NOT NULL,
+                remark TEXT,
+                added_at REAL,
+                last_seen REAL
+            );
+
             CREATE TABLE IF NOT EXISTS schedule (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 enabled INTEGER DEFAULT 0,
@@ -316,6 +325,62 @@ class Database:
             f"DELETE FROM pending_configs WHERE config_hash IN ({placeholders})",
             hashes,
         )
+        await self._conn.commit()
+
+
+    # ---------- personal configs (بخش شخصی) ----------
+    async def add_personal_configs(self, links: list[str]) -> tuple[int, int]:
+        """افزودن به بخش شخصی. برمی‌گردونه: (تعداد جدید, تکراری)"""
+        from app.services.config_extractor import config_hash, get_remark
+        new_count = 0
+        dup_count = 0
+        now = time.time()
+        for link in links:
+            h = config_hash(link)
+            cur = await self._conn.execute(
+                "SELECT 1 FROM personal_configs WHERE config_hash = ?", (h,)
+            )
+            exists = await cur.fetchone() is not None
+            await self._conn.execute(
+                """
+                INSERT INTO personal_configs (config_hash, config_line, remark, added_at, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(config_hash) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    config_line = excluded.config_line
+                """,
+                (h, link, get_remark(link), now, now),
+            )
+            if exists:
+                dup_count += 1
+            else:
+                new_count += 1
+        await self._conn.commit()
+        return new_count, dup_count
+
+    async def count_personal(self) -> int:
+        cur = await self._conn.execute("SELECT COUNT(*) AS c FROM personal_configs")
+        row = await cur.fetchone()
+        return int(row["c"]) if row else 0
+
+    async def list_personal(self, limit: int = 300) -> list:
+        cur = await self._conn.execute(
+            "SELECT * FROM personal_configs ORDER BY last_seen DESC LIMIT ?", (limit,)
+        )
+        return await cur.fetchall()
+
+    async def remove_personal_by_hashes(self, hashes: list[str]):
+        if not hashes:
+            return
+        placeholders = ",".join("?" * len(hashes))
+        await self._conn.execute(
+            f"DELETE FROM personal_configs WHERE config_hash IN ({placeholders})",
+            hashes,
+        )
+        await self._conn.commit()
+
+    async def clear_personal(self):
+        await self._conn.execute("DELETE FROM personal_configs")
         await self._conn.commit()
 
 
