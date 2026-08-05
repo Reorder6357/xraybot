@@ -379,6 +379,31 @@ def build_xray_config(outbound: dict, local_port: int) -> dict:
 
 # -------------------- تست یک کانفیگ --------------------
 
+# هدف‌های تست اتصال: فقط پاسخ 200/204 معتبر است (هر چیز دیگر = مرده)
+CONNECTIVITY_TARGETS = [
+    ("https://www.gstatic.com/generate_204", {200, 204}),
+    ("https://cp.cloudflare.com/", {200, 204}),
+]
+
+# هدف‌های راستی‌آزمایی خروجی: باید 200 برگردانند و IP واقعی بدهند
+EGRESS_TARGETS = [
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://api.ipify.org?format=json",
+]
+
+
+def _parse_cf_trace(text: str) -> tuple[str, str]:
+    """پارس کردن پاسخ cdn-cgi/trace: (ip, loc)"""
+    ip = loc = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("ip="):
+            ip = line[3:].strip()
+        elif line.startswith("loc="):
+            loc = line[4:].strip()
+    return ip, loc
+
+
 async def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -390,8 +415,12 @@ async def test_one_config(
     timeout: float = 8.0,
 ) -> TestResult:
     """
-    یک کانفیگ را تست می‌کند.
-    خروجی: TestResult
+    تست سختگیرانه یک کانفیگ:
+      ۱) تونل تا سرور برقرار شود و پاسخ HTTP معتبر (۲۰۰/۲۰۴) برگردد
+      ۲) ترافیک واقعاً به اینترنت خروجی داشته باشد (IP خروجی قابل تأیید)
+    فقط وقتی هر دو مرحله پاس شود، کانفیگ «سالم» حساب می‌شود.
+    (قبل از این فیکس، هر پاسخ HTTP — حتی صفحه خطای ۵۰۲ از پنل/CDN —
+     سالم حساب می‌شد و سرورهای مرده بالای لیست می‌آمدند.)
     """
     info = parse_basic_info(link)
     result = TestResult(
@@ -434,44 +463,61 @@ async def test_one_config(
 
         # تست از طریق SOCKS
         proxy_url = f"socks5://127.0.0.1:{port}"
-        start = time.perf_counter()
 
         async with httpx.AsyncClient(
             proxy=proxy_url,
             timeout=timeout,
-            follow_redirects=False,
+            follow_redirects=True,
         ) as client:
-            # دو مرحله: اول یک endpoint سبک برای latency، بعد IP
-            try:
-                r = await client.get("http://cp.cloudflare.com/")
-                latency = (time.perf_counter() - start) * 1000
-                result.latency_ms = round(latency, 1)
-                result.success = True
-            except Exception as e1:
-                # fallback
+            # ---- مرحله ۱: اتصال + latency (فقط 200/204 قبول است) ----
+            stage_ok = False
+            last_err = "connect_failed"
+            for url, ok_codes in CONNECTIVITY_TARGETS:
+                start = time.perf_counter()
                 try:
-                    start = time.perf_counter()
-                    r = await client.get("http://1.1.1.1/cdn-cgi/trace")
+                    resp = await client.get(url)
                     latency = (time.perf_counter() - start) * 1000
-                    result.latency_ms = round(latency, 1)
-                    result.success = True
-                except Exception as e2:
-                    result.error = f"connect_failed: {type(e2).__name__}"
-                    return result
+                    if resp.status_code in ok_codes:
+                        result.latency_ms = round(latency, 1)
+                        stage_ok = True
+                        break
+                    last_err = f"http_error:{resp.status_code}"
+                except Exception as e:
+                    last_err = f"connect_failed:{type(e).__name__}"
 
-            # گرفتن IP خروجی
-            try:
-                ip_resp = await client.get("http://ip-api.com/json/?fields=status,country,countryCode,query")
-                if ip_resp.status_code == 200:
-                    data = ip_resp.json()
-                    if data.get("status") == "success":
-                        result.exit_ip = data.get("query") or ""
-                        result.country_code = (data.get("countryCode") or "").upper()
-                        result.country_name = data.get("country") or COUNTRY_NAMES.get(result.country_code, result.country_code)
-            except Exception:
-                # اگه IP نگرفتیم باز هم موفقیت‌آمیز حساب می‌شه
-                pass
+            if not stage_ok:
+                result.error = last_err
+                return result
 
+            # ---- مرحله ۲: راستی‌آزمایی خروجی واقعی (IP + کشور) ----
+            egress_ok = False
+            for url in EGRESS_TARGETS:
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    if "cdn-cgi/trace" in url:
+                        ip, loc = _parse_cf_trace(resp.text)
+                    else:
+                        data = resp.json()
+                        ip = str(data.get("ip") or "")
+                        loc = str(data.get("country") or "")
+                    if ip:
+                        result.exit_ip = ip
+                        result.country_code = (loc or "").upper()
+                        result.country_name = COUNTRY_NAMES.get(
+                            result.country_code, result.country_code or "Unknown"
+                        )
+                        egress_ok = True
+                        break
+                except Exception:
+                    continue
+
+            if not egress_ok:
+                result.error = "egress_failed (خروجی تأیید نشد)"
+                return result
+
+        result.success = True
         return result
 
     except Exception as e:
