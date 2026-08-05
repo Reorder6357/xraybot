@@ -8,7 +8,7 @@ import asyncio
 import io
 import logging
 import zipfile
-from telegram import Update, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
