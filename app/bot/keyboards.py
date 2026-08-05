@@ -77,6 +77,7 @@ def settings_menu(is_owner: bool) -> InlineKeyboardMarkup:
 def github_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔑 تنظیم توکن و ریپو", callback_data="set_github")],
+        [InlineKeyboardButton("📦 آپدیت از فایل ZIP", callback_data="update_from_zip")],
         [InlineKeyboardButton("📤 دیپلوی فایل‌های فعلی", callback_data="deploy_now")],
         [InlineKeyboardButton("📋 وضعیت گیت‌هاب", callback_data="github_status")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],

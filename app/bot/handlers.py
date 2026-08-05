@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import io
 import logging
+import zipfile
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -34,6 +36,62 @@ from app.services.collector import collect_from_subscriptions, collect_all
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# -------------------- آپدیت از فایل ZIP --------------------
+ZIP_MAX_SIZE = 10 * 1024 * 1024          # 10MB فایل zip
+ZIP_MAX_UNCOMPRESSED = 30 * 1024 * 1024  # حداکثر حجم کل بعد از باز شدن
+ZIP_MAX_FILES = 300                      # حداکثر تعداد فایل
+UPDATE_ROOT_FILES = {"Dockerfile", "requirements.txt", "README.md", ".gitignore", "railway.toml"}
+UPDATE_EXT = {".py", ".txt", ".md", ".json", ".yml", ".yaml", ".toml", ".cfg", ".ini"}
+UPDATE_SKIP_DIRS = {"__pycache__", "data", "outputs", ".venv", "venv", "node_modules", ".git"}
+
+
+def parse_update_zip(data: bytes) -> tuple[bool, str, dict]:
+    """
+    استخراج امن فایل‌های کد از ZIP آپدیت.
+    فقط فایل‌های app/ (متن‌ی) + چند فایل ریشه (Dockerfile و...) قبول می‌شه.
+    برمی‌گردونه: (موفق?, پیام, {path_in_repo: content})
+    """
+    if len(data) > ZIP_MAX_SIZE:
+        return False, "حجم فایل زیپ بیشتر از حد مجاز (۱۰MB) است.", {}
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return False, "این فایل یک ZIP معتبر نیست.", {}
+
+    files: dict = {}
+    total = 0
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        # ضد zip-slip و مسیرهای عجیب
+        norm = name.replace("\\", "/")
+        parts = [x for x in norm.split("/") if x not in ("", ".")]
+        if not parts or norm.startswith("/") or ".." in parts or ":" in parts[0]:
+            continue
+        if any(s in parts for s in UPDATE_SKIP_DIRS):
+            continue
+        # فقط app/ و چند فایل ریشه
+        if parts[0] == "app":
+            if Path(norm).suffix.lower() not in UPDATE_EXT:
+                continue
+        else:
+            if norm not in UPDATE_ROOT_FILES:
+                continue
+        total += info.file_size
+        if total > ZIP_MAX_UNCOMPRESSED or len(files) >= ZIP_MAX_FILES:
+            return False, "فایل زیپ بیش از حد بزرگ است یا تعداد فایل‌هایش زیاد است.", {}
+        try:
+            content = zf.read(info).decode("utf-8")
+        except UnicodeDecodeError:
+            return False, f"فایل {norm} متنی نیست (فرمت پشتیبانی نمی‌شود).", {}
+        files[norm] = content
+
+    if not files:
+        return False, "هیچ فایل قابل آپدیتی در زیپ پیدا نشد (باید فایل‌های app/ باشند).", {}
+    return True, f"{len(files)} فایل از ZIP استخراج شد.", files
+
 
 # Conversation states
 (
@@ -297,6 +355,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ در حال جمع‌آوری فایل‌ها و دیپلوی به گیت‌هاب...")
         ok, msg = await github_deployer.deploy_current_project(
             commit_message="Deploy from Telegram bot",
+        )
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=github_menu())
+        return
+
+    if data == "update_from_zip":
+        if not is_owner:
+            await query.answer("⛔ فقط مدیر اصلی", show_alert=True)
+            return
+        await query.edit_message_text(
+            "📦 آپدیت از فایل ZIP:\n\n"
+            "فایل ZIP آپدیت (شامل پوشه `app/`) رو بفرست.\n"
+            "ربات فایل‌ها رو به گیت‌هاب push می‌کنه و Railway خودش دیپلوی می‌کنه.\n"
+            "بعد از ارسال، قبل از push ازت تأیید می‌گیره.",
+            parse_mode="Markdown",
+            reply_markup=back_only(),
+        )
+        return
+
+    if data == "confirm_update_zip":
+        if not is_owner:
+            await query.answer("⛔ فقط مدیر اصلی", show_alert=True)
+            return
+        files = context.user_data.pop("update_zip_files", None)
+        if not files:
+            await query.edit_message_text(
+                "❌ فایل ZIP پیدا نشد؛ دوباره فایل رو بفرست.",
+                reply_markup=back_only(),
+            )
+            return
+        await query.edit_message_text("⏳ در حال push به گیت‌هاب...")
+        ok, msg = await github_deployer.deploy_files(
+            files, commit_message="Update from bot ZIP"
         )
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=github_menu())
         return
@@ -565,6 +655,43 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def handle_update_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت ZIP آپدیت از مدیر اصلی و push به گیت‌هاب"""
+    message = update.effective_message
+    user = update.effective_user
+    if user is None or not settings.is_owner(user.id):
+        return  # فقط مدیر اصلی؛ بقیه با هندلرهای بعدی پردازش می‌شن
+
+    doc = message.document
+    if not doc or not (doc.file_name or "").lower().endswith(".zip"):
+        return  # هندلرهای بعدی ادامه بدن
+
+    status = await message.reply_text("📦 در حال بررسی فایل ZIP...")
+    try:
+        tg_file = await doc.get_file()
+        data = await tg_file.download_as_bytearray()
+    except Exception as e:
+        await status.edit_text(f"❌ خطا در دانلود فایل: {e}")
+        return
+
+    ok, msg, files = parse_update_zip(bytes(data))
+    if not ok:
+        await status.edit_text(f"❌ {msg}", reply_markup=back_only())
+        return
+
+    names = "\n".join(f"• `{n}`" for n in sorted(files)[:25])
+    if len(files) > 25:
+        names += f"\n• و {len(files) - 25} فایل دیگر..."
+    context.user_data["update_zip_files"] = files
+    await status.edit_text(
+        f"✅ {msg}\n\n{names}\n\n"
+        "این فایل‌ها مستقیم به گیت‌هاب push می‌شن و Railway خودش آپدیت می‌کنه.\n"
+        "مطمئنی؟",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard("confirm_update_zip", "back_main"),
+    )
+
+
 @admin_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """فایل متنی حاوی کانفیگ"""
@@ -815,6 +942,11 @@ def setup_handlers(application: Application):
     # استخراج کانفیگ از پیام متنی و فوروارد
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+    )
+
+    # 📦 آپدیت از ZIP (فقط owner) — باید قبل از هندلر فایل معمولی باشه
+    application.add_handler(
+        MessageHandler(filters.Document.FileExtension("zip"), handle_update_zip)
     )
 
     # استخراج از فایل
