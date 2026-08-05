@@ -297,8 +297,9 @@ class Database:
         return int(row["c"]) if row else 0
 
     async def get_pending_configs(self, limit: int = 5000) -> list:
+        # oldest-first تا کانفیگ‌های قدیمی‌تر همیشه نوبتشون برسه (جلوگیری از گرسنگی)
         cur = await self._conn.execute(
-            "SELECT * FROM pending_configs ORDER BY last_seen DESC LIMIT ?",
+            "SELECT * FROM pending_configs ORDER BY added_at ASC, last_seen ASC LIMIT ?",
             (limit,),
         )
         return await cur.fetchall()

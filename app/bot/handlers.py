@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-from app.core.config import settings
+from app.core.config import settings, DATA_DIR
 from app.core.database import db
 from app.bot.keyboards import (
     main_menu, channels_menu, subs_menu, tag_menu,
@@ -44,12 +44,17 @@ logger = logging.getLogger(__name__)
     WAIT_GITHUB_TOKEN,
     WAIT_GITHUB_REPO,
     WAIT_ADMIN_ID,
-) = range(7)
+    WAIT_REMOVE_CHANNEL,
+    WAIT_REMOVE_SUB,
+) = range(9)
 
 
 def owner_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
+        user = update.effective_user
+        if user is None:
+            return  # پیام‌های کانال/سرویس کاربر ندارن
+        user_id = user.id
         if not settings.is_owner(user_id):
             if update.callback_query:
                 await update.callback_query.answer("⛔ فقط مدیر اصلی دسترسی دارد", show_alert=True)
@@ -62,7 +67,10 @@ def owner_only(func):
 
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
+        user = update.effective_user
+        if user is None:
+            return  # پیام‌های کانال/سرویس کاربر ندارن
+        user_id = user.id
         if not settings.is_admin(user_id):
             if update.callback_query:
                 await update.callback_query.answer("⛔ دسترسی ندارید", show_alert=True)
@@ -157,10 +165,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = []
             for r in rows:
                 uname = f"@{r['username']}" if r["username"] else r["chat_id"]
-                lines.append(f"• {r['title'] or uname} (`{r['chat_id']}`)")
-            text = "لیست کانال‌ها:\n\n" + "\n".join(lines)
+                lines.append(f"• `{r['title'] or uname}` (`{r['chat_id']}`)")
+            text = ("لیست کانال‌ها (برای حذف از دکمه 🗑 استفاده کن):\n\n"
+                    + "\n".join(lines))
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=channels_menu())
         return
+
+    if data == "remove_channel":
+        await query.edit_message_text(
+            "آیدی یا یوزرنیم کانالی که می‌خوای حذف بشه رو بفرست:\n"
+            "مثال:\n`-1001234567890`\nیا\n`@mychannel`",
+            parse_mode="Markdown",
+            reply_markup=back_only(),
+        )
+        return WAIT_REMOVE_CHANNEL
+
+    if data == "remove_sub":
+        await query.edit_message_text(
+            "لینک سابی که می‌خوای حذف بشه رو بفرست (یا قسمتی از لینک):",
+            reply_markup=back_only(),
+        )
+        return WAIT_REMOVE_SUB
+
+    if data == "manage_admins":
+        lines = [f"• `{a}`" for a in settings.admin_ids] or ["• (فعلاً ادمین اضافه‌ای نیست)"]
+        await query.edit_message_text(
+            "مدیریت ادمین‌ها (غیر از مدیر اصلی):\n\n"
+            + "\n".join(lines)
+            + "\n\nآیدی عددی ادمین جدید رو بفرست تا اضافه بشه:",
+            parse_mode="Markdown",
+            reply_markup=back_only(),
+        )
+        return WAIT_ADMIN_ID
 
     # ---- Subs ----
     if data == "add_sub":
@@ -338,7 +374,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "last_output":
-        out_dir = Path("/app/data/outputs")
+        out_dir = DATA_DIR / "outputs"
         if not out_dir.exists():
             await query.edit_message_text("هنوز خروجی‌ای تولید نشده.", reply_markup=back_only())
             return
@@ -408,11 +444,13 @@ async def received_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def received_schedule_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [l.strip() for l in update.effective_message.text.strip().splitlines() if l.strip()]
-    # اعتبارسنجی ساده HH:MM
+    # اعتبارسنجی HH:MM (ساعت ۰-۲۳، دقیقه ۰-۵۹)
     valid = []
     for t in lines:
         if len(t) == 5 and t[2] == ":" and t[:2].isdigit() and t[3:].isdigit():
-            valid.append(t)
+            h, m = int(t[:2]), int(t[3:])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                valid.append(t)
     if not valid:
         await update.effective_message.reply_text("❌ فرمت اشتباه. دوباره تلاش کن.")
         return WAIT_SCHEDULE_TIMES
@@ -596,6 +634,77 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def received_remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.effective_message.text.strip()
+    rows = await db.list_channels(only_active=False)
+    found = None
+    for r in rows:
+        uname = r["username"] or ""
+        if str(r["chat_id"]) == text or uname == text.lstrip("@") or f"@{uname}" == text:
+            found = r
+            break
+    if not found:
+        await update.effective_message.reply_text(
+            "❌ کانالی با این مشخصات پیدا نشد.",
+            reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+        )
+        return ConversationHandler.END
+    await db.remove_channel(str(found["chat_id"]))
+    await update.effective_message.reply_text(
+        f"✅ کانال `{found['title'] or found['chat_id']}` حذف شد.",
+        parse_mode="Markdown",
+        reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+    )
+    return ConversationHandler.END
+
+
+async def received_remove_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.effective_message.text.strip()
+    rows = await db.list_subscriptions(only_active=False)
+    found = None
+    for r in rows:
+        if r["url"] == text or text in r["url"]:
+            found = r
+            break
+    if not found:
+        await update.effective_message.reply_text(
+            "❌ سابی با این مشخصات پیدا نشد.",
+            reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+        )
+        return ConversationHandler.END
+    await db.remove_subscription(found["url"])
+    await update.effective_message.reply_text(
+        "✅ ساب حذف شد.",
+        reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
+    )
+    return ConversationHandler.END
+
+
+@owner_only
+async def received_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.effective_message.text.strip()
+    if not text.lstrip("-").isdigit():
+        await update.effective_message.reply_text(
+            "❌ فقط آیدی عددی بفرست.", reply_markup=back_only()
+        )
+        return WAIT_ADMIN_ID
+    aid = int(text)
+    if aid == settings.owner_id:
+        await update.effective_message.reply_text("این آیدی خود مدیر اصلیه.")
+        return ConversationHandler.END
+    if aid in settings.admin_ids:
+        await update.effective_message.reply_text("این آیدی از قبل ادمینه.")
+        return ConversationHandler.END
+    settings.admin_ids.append(aid)
+    await db.set_setting("admin_ids", settings.admin_ids)
+    await update.effective_message.reply_text(
+        f"✅ ادمین `{aid}` اضافه شد.",
+        parse_mode="Markdown",
+        reply_markup=main_menu(True),
+    )
+    return ConversationHandler.END
+
+
 @admin_only
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """نمایش تعداد کانفیگ‌های در صف"""
@@ -684,6 +793,9 @@ def setup_handlers(application: Application):
             WAIT_SCHEDULE_TIMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_schedule_times)],
             WAIT_GITHUB_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_github_token)],
             WAIT_GITHUB_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_github_repo)],
+            WAIT_REMOVE_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_remove_channel)],
+            WAIT_REMOVE_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_remove_sub)],
+            WAIT_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_admin_id)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(callback_router)],
         allow_reentry=True,
@@ -693,6 +805,13 @@ def setup_handlers(application: Application):
     # callbackهای معمولی
     application.add_handler(CallbackQueryHandler(callback_router))
 
+    # ⚠️ پست‌های کانال باید اولین MessageHandler باشن!
+    # (اگه بعد از فیلتر TEXT ثبت بشن، پست کانال اول به handle_text_message می‌خوره
+    #  و دکوریتور admin_only روی effective_user=None کرش می‌کنه — مانیتور کانال کار نمی‌کنه)
+    application.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
+    )
+
     # استخراج کانفیگ از پیام متنی و فوروارد
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
@@ -701,9 +820,4 @@ def setup_handlers(application: Application):
     # استخراج از فایل
     application.add_handler(
         MessageHandler(filters.Document.ALL, handle_document)
-    )
-
-    # پست‌های کانال (اگر ربات ادمین باشد)
-    application.add_handler(
-        MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
     )

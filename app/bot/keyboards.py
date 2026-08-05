@@ -71,7 +71,6 @@ def settings_menu(is_owner: bool) -> InlineKeyboardMarkup:
     ]
     if is_owner:
         buttons.insert(0, [InlineKeyboardButton("👤 مدیریت ادمین‌ها", callback_data="manage_admins")])
-        buttons.insert(1, [InlineKeyboardButton("🔑 تنظیمات حساس", callback_data="owner_settings")])
     return InlineKeyboardMarkup(buttons)
 
 

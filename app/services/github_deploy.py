@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from pathlib import Path
@@ -33,10 +34,12 @@ class GitHubDeployer:
             return False
 
         try:
-            self._gh = Github(token)
-            self._repo = self._gh.get_repo(repo_name)
-            # تست دسترسی
-            _ = self._repo.full_name
+            # PyGithub سینکرونه؛ توی thread جدا اجرا می‌شه تا event loop بلاک نشه
+            gh = await asyncio.to_thread(Github, token)
+            repo = await asyncio.to_thread(gh.get_repo, repo_name)
+            _ = await asyncio.to_thread(lambda: repo.full_name)
+            self._gh = gh
+            self._repo = repo
             return True
         except Exception as e:
             logger.error(f"GitHub credentials invalid: {e}")
@@ -47,9 +50,9 @@ class GitHubDeployer:
     async def save_credentials(self, token: str, repo: str) -> tuple[bool, str]:
         """ذخیره توکن و ریپو (فقط owner)"""
         try:
-            gh = Github(token)
-            r = gh.get_repo(repo)
-            _ = r.full_name  # تست
+            gh = await asyncio.to_thread(Github, token)
+            r = await asyncio.to_thread(gh.get_repo, repo)
+            _ = await asyncio.to_thread(lambda: r.full_name)  # تست
 
             await db.set_setting("github_token", token)
             await db.set_setting("github_repo", repo)
@@ -74,38 +77,42 @@ class GitHubDeployer:
             return False, "❌ توکن یا ریپوی گیت‌هاب تنظیم نشده. اول از دکمه «تنظیم گیت‌هاب» استفاده کن."
 
         try:
-            # گرفتن آخرین کامیت شاخه اصلی
-            default_branch = self._repo.default_branch
-            ref = self._repo.get_git_ref(f"heads/{default_branch}")
-            latest_commit = self._repo.get_git_commit(ref.object.sha)
-            base_tree = latest_commit.tree
+            async def _do_deploy():
+                # گرفتن آخرین کامیت شاخه اصلی
+                default_branch = self._repo.default_branch
+                ref = self._repo.get_git_ref(f"heads/{default_branch}")
+                latest_commit = self._repo.get_git_commit(ref.object.sha)
+                base_tree = latest_commit.tree
 
-            # ساخت tree جدید
-            element_list = []
-            for path, content in files.items():
-                # اگر فایل باینری بود base64 می‌کنیم، فعلاً همه متنی هستن
-                blob = self._repo.create_git_blob(content, "utf-8")
-                element = InputGitTreeElement(
-                    path=path,
-                    mode="100644",
-                    type="blob",
-                    sha=blob.sha,
+                # ساخت tree جدید
+                element_list = []
+                for path, content in files.items():
+                    # اگر فایل باینری بود base64 می‌کنیم، فعلاً همه متنی هستن
+                    blob = self._repo.create_git_blob(content, "utf-8")
+                    element = InputGitTreeElement(
+                        path=path,
+                        mode="100644",
+                        type="blob",
+                        sha=blob.sha,
+                    )
+                    element_list.append(element)
+
+                new_tree = self._repo.create_git_tree(element_list, base_tree)
+                new_commit = self._repo.create_git_commit(
+                    message=commit_message,
+                    tree=new_tree,
+                    parents=[latest_commit],
                 )
-                element_list.append(element)
+                ref.edit(new_commit.sha)
+                return default_branch, new_commit.sha
 
-            new_tree = self._repo.create_git_tree(element_list, base_tree)
-            new_commit = self._repo.create_git_commit(
-                message=commit_message,
-                tree=new_tree,
-                parents=[latest_commit],
-            )
-            ref.edit(new_commit.sha)
+            default_branch, commit_sha = await asyncio.to_thread(_do_deploy)
 
             return True, (
                 f"✅ دیپلوی موفق\n"
                 f"ریپو: `{self._repo.full_name}`\n"
                 f"شاخه: `{default_branch}`\n"
-                f"کامیت: `{new_commit.sha[:7]}`\n\n"
+                f"کامیت: `{commit_sha[:7]}`\n\n"
                 f"Railway تا چند دقیقه دیگه اتومات آپدیت می‌کنه."
             )
         except GithubException as e:
@@ -118,7 +125,9 @@ class GitHubDeployer:
         if not await self.load_credentials():
             return "🔴 گیت‌هاب تنظیم نشده"
         try:
-            return f"🟢 متصل به `{self._repo.full_name}` (شاخه: {self._repo.default_branch})"
+            full = await asyncio.to_thread(lambda: self._repo.full_name)
+            branch = await asyncio.to_thread(lambda: self._repo.default_branch)
+            return f"🟢 متصل به `{full}` (شاخه: {branch})"
         except Exception:
             return "🔴 مشکل در اتصال به گیت‌هاب"
 
@@ -128,7 +137,7 @@ class GitHubDeployer:
         برای دیپلوی کامل از داخل کانتینر.
         """
         if root is None:
-            root = Path("/app")
+            root = Path("/app") if Path("/app").exists() else Path.cwd()
 
         files: dict[str, str] = {}
         include_ext = {".py", ".txt", ".md", ".toml", ".yml", ".yaml", ".json", ".cfg", ".ini"}

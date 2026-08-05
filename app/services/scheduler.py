@@ -86,18 +86,29 @@ async def scheduled_job():
 
 async def reload_schedule():
     """بارگذاری مجدد زمان‌بندی از دیتابیس"""
-    # پاک کردن جاب‌های قبلی
-    scheduler.remove_all_jobs()
-
     sched = await db.get_schedule()
     if not sched["enabled"] or not sched["times"]:
+        scheduler.remove_all_jobs()
         logger.info("Schedule disabled or empty")
         return
 
+    # اول همه ساعت‌ها رو اعتبارسنجی کن؛ اگه یکی غلط بود، برنامه قبلی رو پاک نکن
+    parsed_times = []
     for t in sched["times"]:
         try:
             hour, minute = t.split(":")
             hour, minute = int(hour), int(minute)
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"out of range: {t}")
+            parsed_times.append((t, hour, minute))
+        except Exception as e:
+            logger.error(f"Invalid schedule time {t}: {e}")
+            return  # برنامه قبلی دست‌نخورده می‌مونه
+
+    scheduler.remove_all_jobs()
+
+    for t, hour, minute in parsed_times:
+        try:
             job_id = f"run_{hour:02d}_{minute:02d}"
             scheduler.add_job(
                 scheduled_job,
@@ -108,7 +119,7 @@ async def reload_schedule():
             )
             logger.info(f"Scheduled job at {t}")
         except Exception as e:
-            logger.error(f"Invalid schedule time {t}: {e}")
+            logger.error(f"Failed to schedule {t}: {e}")
 
 
 def start_scheduler():

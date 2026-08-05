@@ -6,10 +6,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import ipaddress
 import logging
+import socket
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -17,6 +21,41 @@ from app.core.database import db
 from app.services.config_extractor import extract_links_from_text
 
 logger = logging.getLogger(__name__)
+
+MAX_SUB_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+def _is_private_host(url: str) -> bool:
+    """
+    جلوگیری از SSRF: اگر هاست ساب به IP خصوصی/لوکال/متادیتا اشاره کند رد می‌شود.
+    (مثلاً http://169.254.169.254/ یا http://192.168.1.1/)
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return True
+        host = parsed.hostname or ""
+        if not host:
+            return True
+        # آی‌پی مستقیم
+        try:
+            addr = ipaddress.ip_address(host)
+            return addr.is_private or addr.is_loopback or addr.is_link_local \
+                or addr.is_multicast or addr.is_reserved or addr.is_unspecified
+        except ValueError:
+            pass
+        # رزولوشن DNS (بلوکینگ — در to_thread صدا زده می‌شه)
+        for info in socket.getaddrinfo(host, None):
+            try:
+                addr = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            if addr.is_private or addr.is_loopback or addr.is_link_local \
+                    or addr.is_multicast or addr.is_reserved:
+                return True
+        return False
+    except Exception:
+        return True  # رد شدن امن‌تر از پذیرفتنه
 
 
 async def fetch_subscription(url: str, timeout: float = 20.0) -> list[str]:
@@ -27,14 +66,33 @@ async def fetch_subscription(url: str, timeout: float = 20.0) -> list[str]:
     - base64 (رایج در ساب‌های ایرانی/چینی)
     """
     try:
+        # گارد SSRF
+        if await asyncio.to_thread(_is_private_host, url):
+            logger.warning(f"Subscription blocked (private host): {url[:60]}")
+            return []
+
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0 (compatible; XrayBot/1.0)"},
         ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            raw = resp.content
+            # محدودیت حجم
+            length = None
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > MAX_SUB_SIZE:
+                    logger.warning(f"Subscription too large: {url[:60]} ({cl} bytes)")
+                    return []
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_SUB_SIZE:
+                        logger.warning(f"Subscription exceeded size cap: {url[:60]}")
+                        return []
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
 
         # سعی در decode
         text = None

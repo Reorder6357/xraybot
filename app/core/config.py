@@ -1,9 +1,28 @@
+import os
 from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DATA_DIR = Path("/app/data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _default_data_dir() -> Path:
+    """مسیر داده: اول env DATA_DIR، بعد /app/data (داخل داکر/ریل‌وی)،
+    و اگر قابل نوشتن نبود (تست لوکال) مسیر محلی data/"""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        p = Path(env)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    p = Path("/app/data")
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except OSError:
+        local = Path.cwd() / "data"
+        local.mkdir(parents=True, exist_ok=True)
+        return local
+
+
+DATA_DIR = _default_data_dir()
 
 
 class Settings(BaseSettings):

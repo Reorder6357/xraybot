@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -22,6 +23,9 @@ from app.services.config_extractor import config_hash
 from app.services.xray_tester import test_batch, select_top, TestResult
 
 logger = logging.getLogger(__name__)
+
+# قفل اجرای همزمان: جلوگیری از دو تست موازی (دکمه دستی + زمان‌بندی + دوبار کلیک)
+_run_lock = asyncio.Lock()
 
 
 class RunResult:
@@ -54,8 +58,26 @@ async def run_full_test(
     concurrency = concurrency or settings.test_concurrency
     keep_top = keep_top or settings.keep_top_n
 
+    if _run_lock.locked():
+        result.error = "یک اجرای تست در حال انجام است (کمی صبر کن)"
+        return result
+
+    async with _run_lock:
+        return await _run_locked(
+            result, max_configs, concurrency, keep_top, progress_callback, t0
+        )
+
+
+async def _run_locked(
+    result: RunResult,
+    max_configs: int,
+    concurrency: int,
+    keep_top: int,
+    progress_callback: Optional[Callable],
+    t0: float,
+) -> RunResult:
     try:
-        # ۱. گرفتن کانفیگ‌های در صف
+        # ۱. گرفتن کانفیگ‌های در صف (قدیمی‌ترین‌ها اول)
         rows = await db.get_pending_configs(limit=max_configs)
         links = [r["config_line"] for r in rows]
         result.total_input = len(links)
@@ -130,15 +152,30 @@ async def run_full_test(
         out_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
         result.output_file = out_path
 
-        # ۸. پاکسازی تاریخچه قدیمی
-        await db.cleanup_old_history(ttl_hours=settings.history_ttl_hours)
-
-        # ۹. آپدیت last_run
-        await db.update_last_run()
-
     except Exception as e:
         logger.exception("run_full_test failed")
         result.error = str(e)[:200]
+    finally:
+        # ۸. پاکسازی صف: کانفیگ‌های این دوره (موفق + ناموفق) از صف حذف می‌شن.
+        #     اینطوری صف همیشه «تست‌نشده»هاست و هر بار همه‌چیز دوباره تست نمی‌شه؛
+        #     کانفیگ‌های سالم تا ۲۴ ساعت توی history هستن و ساب‌ها هم هر دوره دوباره جمع می‌شن.
+        if links:
+            try:
+                await db.delete_pending_by_hashes([config_hash(l) for l in links])
+            except Exception as e:
+                logger.warning(f"Failed to clean pending queue: {e}")
+
+        # ۹. پاکسازی تاریخچه قدیمی
+        try:
+            await db.cleanup_old_history(ttl_hours=settings.history_ttl_hours)
+        except Exception:
+            pass
+
+        # ۱۰. آپدیت last_run
+        try:
+            await db.update_last_run()
+        except Exception:
+            pass
 
     result.duration_sec = round(time.perf_counter() - t0, 1)
     return result

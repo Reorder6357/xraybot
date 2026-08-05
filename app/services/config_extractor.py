@@ -23,6 +23,10 @@ LINK_PATTERNS = [
     r'(?:vless|vmess|trojan):[a-zA-Z0-9+/=_-]{20,}@[^\s<>"\']+',
 ]
 
+# پروتکل‌هایی که موتور تست (xray_tester) واقعاً می‌تونه تست کنه.
+# بقیه (ssr/hysteria2/tuic/wireguard/...) قابل تست نیستن و فقط صف رو پر می‌کنن.
+TESTABLE_SCHEMES = {"vless", "vmess", "trojan", "ss"}
+
 # کامپایل برای سرعت
 COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in LINK_PATTERNS]
 
@@ -74,6 +78,10 @@ def extract_links_from_text(text: str) -> list[str]:
         for match in pattern.finditer(text):
             link = _clean_link(match.group(0))
             if not _is_valid_proxy_link(link):
+                continue
+            # فقط پروتکل‌هایی که موتور تست پشتیبانی می‌کنه (بقیه صف رو پر می‌کنن)
+            scheme = link.split('://', 1)[0].lower()
+            if scheme not in TESTABLE_SCHEMES:
                 continue
             # برای حذف تکراری، نسخه بدون ریمارک رو هش می‌کنیم
             key = normalize_for_dedup(link)
