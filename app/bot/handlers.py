@@ -53,6 +53,26 @@ def _esc(s: str) -> str:
 NON_TESTABLE_SCHEMES = {"hysteria2", "hy2", "tuic", "ssr", "wireguard", "hysteria", "kcp"}
 
 
+def _forward_source_detail(message) -> str:
+    """نام کانال/کاربر مبدأ فوروارد رو با forward_origin (ساختار جدید PTB v21) برمی‌گردونه.
+    (فیلدهای قدیمی forward_date/forward_from/forward_from_chat توی v21 حذف شدن)"""
+    origin = message.forward_origin
+    if not origin:
+        return ""
+    try:
+        if origin.type == "channel":
+            return origin.chat.title or str(origin.chat.id)
+        if origin.type == "chat":
+            return origin.sender_chat.title or str(origin.sender_chat.id)
+        if origin.type == "user":
+            return origin.sender_user.full_name or str(origin.sender_user.id)
+        if origin.type == "hidden_user":
+            return origin.sender_user_name or "کاربر ناشناس"
+    except Exception:
+        pass
+    return ""
+
+
 def _count_non_testable(text: str) -> int:
     """تعداد لینک‌های پروتکل‌هایی که قابل تست نیستن (فقط برای گزارش به کاربر)"""
     count = 0
@@ -929,12 +949,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # تشخیص منبع
-    source = "forward" if message.forward_origin or message.forward_date else "message"
-    source_detail = ""
-    if message.forward_from_chat:
-        source_detail = message.forward_from_chat.title or str(message.forward_from_chat.id)
-    elif message.forward_from:
-        source_detail = message.forward_from.full_name or str(message.forward_from.id)
+    source = "forward" if message.forward_origin else "message"
+    source_detail = _forward_source_detail(message)
 
     links = extract_from_message_text(text)
 
@@ -1036,12 +1052,8 @@ async def handle_media_caption(update: Update, context: ContextTypes.DEFAULT_TYP
     if message.document is not None:
         return
 
-    source = "forward" if message.forward_origin or message.forward_date else "message"
-    source_detail = ""
-    if message.forward_from_chat:
-        source_detail = message.forward_from_chat.title or str(message.forward_from_chat.id)
-    elif message.forward_from:
-        source_detail = message.forward_from.full_name or str(message.forward_from.id)
+    source = "forward" if message.forward_origin else "message"
+    source_detail = _forward_source_detail(message)
 
     links = extract_from_message_text(caption)
     if not links:
