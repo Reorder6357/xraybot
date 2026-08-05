@@ -50,6 +50,22 @@ def _esc(s: str) -> str:
     return s
 
 
+async def _ensure_fixed_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دکمه‌های ثابت پایین چت: اولین بار که کاربر با ربات حرف می‌زنه میاد و
+    بعدش همیشه پایین چت می‌مونه (تا وقتی عوضش نکنیم). یک بار در هر چت فرستاده می‌شه."""
+    try:
+        if context.chat_data.get("fixed_shown"):
+            return
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⌨️ دکمه‌های سریع:",
+            reply_markup=fixed_menu(),
+        )
+        context.chat_data["fixed_shown"] = True
+    except Exception:
+        pass
+
+
 # -------------------- آپدیت از فایل ZIP --------------------
 ZIP_MAX_SIZE = 10 * 1024 * 1024          # 10MB فایل zip
 ZIP_MAX_UNCOMPRESSED = 30 * 1024 * 1024  # حداکثر حجم کل بعد از باز شدن
@@ -165,13 +181,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         text, reply_markup=main_menu(is_owner)
     )
-    # دکمه‌های ثابت پایین چت
-    try:
-        await update.effective_message.reply_text(
-            "⌨️ دکمه‌های سریع:", reply_markup=fixed_menu()
-        )
-    except Exception:
-        pass
+    await _ensure_fixed_keyboard(update, context)
 
 
 # -------------------- Callback router --------------------
@@ -789,6 +799,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "لغو شد.",
         reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
     )
+    await _ensure_fixed_keyboard(update, context)
     return ConversationHandler.END
 
 
@@ -888,6 +899,7 @@ async def _run_manual_test(
         await update.effective_message.reply_text(
             "منوی اصلی:", reply_markup=main_menu(settings.is_owner(update.effective_user.id))
         )
+    await _ensure_fixed_keyboard(update, context)
 
 
 # -------------------- استخراج کانفیگ از پیام / فایل / فوروارد --------------------
@@ -1053,6 +1065,7 @@ async def handle_media_caption(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(text_out, parse_mode="Markdown", reply_markup=extract_actions_keyboard())
     except Exception:
         await message.reply_text(text_out, reply_markup=extract_actions_keyboard())
+    await _ensure_fixed_keyboard(update, context)
 
 
 @admin_only
@@ -1133,6 +1146,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         await status_msg.edit_text(text, reply_markup=extract_actions_keyboard())
+    await _ensure_fixed_keyboard(update, context)
 
 
 async def received_remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1287,6 +1301,7 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="منوی اصلی:",
         reply_markup=main_menu(settings.is_owner(update.effective_user.id)),
     )
+    await _ensure_fixed_keyboard(update, context)
 
 
 @admin_only
