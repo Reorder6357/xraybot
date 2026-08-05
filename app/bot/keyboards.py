@@ -24,6 +24,9 @@ def main_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("👤 شخصی", callback_data="menu_personal"),
         ],
         [
+            InlineKeyboardButton("📡 اسکن کانال (تکراری‌یاب)", callback_data="menu_scanner"),
+        ],
+        [
             InlineKeyboardButton("🏷️ تگ کانال", callback_data="menu_tag"),
             InlineKeyboardButton("⏰ زمان‌بندی", callback_data="menu_schedule"),
         ],
@@ -131,6 +134,16 @@ def github_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📦 آپدیت از فایل ZIP", callback_data="update_from_zip")],
         [InlineKeyboardButton("📤 دیپلوی فایل‌های فعلی", callback_data="deploy_now")],
         [InlineKeyboardButton("📋 وضعیت گیت‌هاب", callback_data="github_status")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
+    ])
+
+
+def scanner_menu(login_status: bool = False) -> InlineKeyboardMarkup:
+    btn1 = "🔑 ورود با شماره (لاگین)" if not login_status else "✅ وارد شده‌اید"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(btn1, callback_data="scan_login")],
+        [InlineKeyboardButton("📡 اسکن کانال", callback_data="scan_channel")],
+        [InlineKeyboardButton("🗑 پاک کردن داده اسکن", callback_data="scan_clear_data")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
     ])
 

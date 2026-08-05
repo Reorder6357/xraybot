@@ -17,3 +17,4 @@ orjson==3.10.12
 tenacity==9.0.0
 uvloop==0.21.0; sys_platform != "win32"
 python-multipart==0.0.20
+Telethon==1.36.0

@@ -25,6 +25,7 @@ from app.bot.keyboards import (
     main_menu, channels_menu, subs_menu, tag_menu,
     schedule_menu, settings_menu, github_menu, back_only, confirm_keyboard,
     queue_menu, personal_menu, extract_actions_keyboard, cancel_run_keyboard, fixed_menu,
+    scanner_menu,
 )
 from app.services.github_deploy import github_deployer
 from app.services.config_extractor import (
@@ -36,6 +37,7 @@ from app.services.runner import run_full_test, _run_lock
 from app.services.xray_tester import test_batch, select_top, TestResult
 from app.services.scheduler import reload_schedule
 from app.services.collector import collect_from_subscriptions, collect_all
+from app.services.channel_scanner import scanner
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -165,7 +167,13 @@ def parse_update_zip(data: bytes) -> tuple[bool, str, dict]:
     WAIT_ADMIN_ID,
     WAIT_REMOVE_CHANNEL,
     WAIT_REMOVE_SUB,
-) = range(9)
+    WAIT_SCAN_API_ID,
+    WAIT_SCAN_API_HASH,
+    WAIT_SCAN_PHONE,
+    WAIT_SCAN_CODE,
+    WAIT_SCAN_PASSWORD,
+    WAIT_SCAN_CHANNEL,
+) = range(15)
 
 
 def owner_only(func):
@@ -675,6 +683,74 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         else:
             await query.answer("تستی در حال اجرا نیست")
+        return
+
+    # ---- Scanner section ----
+    if data == "menu_scanner":
+        logged = await scanner.is_logged_in()
+        status = "✅ وارد شده‌اید" if logged else "❌ هنوز وارد نشده‌اید"
+        await query.edit_message_text(
+            f"📡 اسکن کانال برای پیدا کردن فایل‌های تکراری\n\n{status}\n\n"
+            f"برای اسکن کامل تاریخچه کانال (اسم فایل، حجم، مدت ویدیو) به یه اکانت تلگرام نیازه.\n"
+            f"اول ورود، بعد اسکن.",
+            reply_markup=scanner_menu(logged),
+        )
+        return
+
+    if data == "scan_login":
+        if not is_owner:
+            await query.answer("⛔ فقط مدیر اصلی", show_alert=True)
+            return
+        # چک api_id/api_hash
+        if not settings.tg_api_id or not settings.tg_api_hash:
+            await query.edit_message_text(
+                "🔑 اول api_id و api_hash لازمه (از my.telegram.org می‌گیری).\n"
+                "api_id رو بفرست:",
+                reply_markup=back_only(),
+            )
+            return WAIT_SCAN_API_ID
+        await query.edit_message_text(
+            "📱 شماره تلفن اکانت اسکنر رو با فرمت بین‌المللی بفرست:\n"
+            "مثال: `+989123456789`",
+            parse_mode="Markdown",
+            reply_markup=back_only(),
+        )
+        return WAIT_SCAN_PHONE
+
+    if data == "scan_channel":
+        await query.edit_message_text(
+            "📡 آیدی عددی کانال یا یوزرنیمش رو بفرست:\n"
+            "مثال: `@mychannel` یا `-1001234567890`\n\n"
+            "⚠️ اکانتی که باهاش وارد شدی باید ادمین/عضو اون کانال باشه.",
+            parse_mode="Markdown",
+            reply_markup=back_only(),
+        )
+        return WAIT_SCAN_CHANNEL
+
+    if data == "scan_clear_data":
+        await db.clear_scanned_files()
+        await query.edit_message_text(
+            "🗑 داده‌ی اسکن (فایل‌های ثبت‌شده) پاک شد.",
+            reply_markup=scanner_menu(await scanner.is_logged_in()),
+        )
+        return
+
+    if data == "scan_confirm_delete":
+        if not is_owner:
+            await query.answer("⛔ فقط مدیر اصلی", show_alert=True)
+            return
+        channel_id = context.user_data.get("scan_groups_channel", "")
+        if not channel_id:
+            await query.answer("اول اسکن کن", show_alert=True)
+            return
+        await do_scan_delete(update, context, channel_id)
+        return
+
+    if data == "scan_cancel_delete":
+        await query.edit_message_text(
+            "🚫 حذف لغو شد.",
+            reply_markup=scanner_menu(await scanner.is_logged_in()),
+        )
         return
 
     if data == "last_output":
@@ -1342,6 +1418,148 @@ async def cmd_personal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# -------------------- Scanner conversation handlers --------------------
+
+@owner_only
+async def received_scan_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.effective_message.text.strip()
+    if not text.isdigit():
+        await update.effective_message.reply_text("❌ api_id فقط عددیه. دوباره بفرست:", reply_markup=back_only())
+        return WAIT_SCAN_API_ID
+    context.user_data["scan_api_id"] = text
+    await update.effective_message.reply_text(
+        "حالا api_hash رو بفرست (یه رشته حرف/عددیه):",
+        reply_markup=back_only(),
+    )
+    return WAIT_SCAN_API_HASH
+
+
+@owner_only
+async def received_scan_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api_hash = update.effective_message.text.strip()
+    api_id = context.user_data.get("scan_api_id")
+    if not api_id:
+        await update.effective_message.reply_text("❌ api_id پیدا نشد. از اول شروع کن.", reply_markup=back_only())
+        return WAIT_SCAN_API_ID
+    settings.tg_api_id = int(api_id)
+    settings.tg_api_hash = api_hash
+    await db.set_setting("tg_api_id", int(api_id))
+    await db.set_setting("tg_api_hash", api_hash)
+    context.user_data.pop("scan_api_id", None)
+    await update.effective_message.reply_text(
+        "✅ api_id و api_hash ذخیره شد.\n📱 حالا شماره تلفن اکانت اسکنر رو بفرست:\nمثال: `+989123456789`",
+        parse_mode="Markdown",
+        reply_markup=back_only(),
+    )
+    return WAIT_SCAN_PHONE
+
+
+@owner_only
+async def received_scan_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.effective_message.text.strip()
+    if not phone.startswith("+"):
+        await update.effective_message.reply_text(
+            "❌ شماره باید با + شروع شه (فرمت بین‌المللی). دوباره بفرست:",
+            reply_markup=back_only(),
+        )
+        return WAIT_SCAN_PHONE
+    context.user_data["scan_phone"] = phone
+    ok, msg = await scanner.request_code(phone)
+    await update.effective_message.reply_text(msg, reply_markup=back_only())
+    if ok:
+        return WAIT_SCAN_CODE
+    return WAIT_SCAN_PHONE
+
+
+@owner_only
+async def received_scan_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.effective_message.text.strip()
+    phone = context.user_data.get("scan_phone", "")
+    ok, msg, need_pw = await scanner.submit_code(phone, code)
+    if need_pw:
+        await update.effective_message.reply_text(msg, reply_markup=back_only())
+        return WAIT_SCAN_PASSWORD
+    await update.effective_message.reply_text(msg, reply_markup=scanner_menu(ok))
+    context.user_data.pop("scan_phone", None)
+    return ConversationHandler.END if ok else WAIT_SCAN_CODE
+
+
+@owner_only
+async def received_scan_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pw = update.effective_message.text.strip()
+    ok, msg = await scanner.submit_password(pw)
+    await update.effective_message.reply_text(msg, reply_markup=scanner_menu(ok))
+    return ConversationHandler.END if ok else WAIT_SCAN_PASSWORD
+
+
+@owner_only
+async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    peer = update.effective_message.text.strip()
+    status = await update.effective_message.reply_text("⏳ در حال اسکن کانال... (ممکنه چند دقیقه طول بکشه)")
+
+    async def progress(count):
+        try:
+            await status.edit_text(f"⏳ در حال اسکن... {count} پیام بررسی شد")
+        except Exception:
+            pass
+
+    ok, msg, nfiles = await scanner.scan_channel(peer, progress_cb=progress)
+    if not ok:
+        await status.edit_text(msg, reply_markup=scanner_menu(await scanner.is_logged_in()))
+        return ConversationHandler.END
+
+    # تشخیص تکراری
+    try:
+        entity = await scanner._client.get_entity(peer)
+        channel_id = str(entity.id)
+        groups = await scanner.find_duplicates(channel_id)
+    except Exception as e:
+        await status.edit_text(f"{msg}\n\n❌ خطا در تشخیص تکراری: {str(e)[:100]}", reply_markup=back_only())
+        return ConversationHandler.END
+
+    if not groups:
+        await status.edit_text(
+            f"{msg}\n\n🎉 هیچ فایل تکراری پیدا نشد!",
+            reply_markup=scanner_menu(True),
+        )
+        return ConversationHandler.END
+
+    total_dups = sum(len(g["dups"]) for g in groups)
+    lines = [f"{msg}", "", f"📦 {len(groups)} گروه تکراری پیدا شد (مجموعاً {total_dups} نسخه اضافه):", ""]
+    for i, g in enumerate(groups[:10], 1):
+        it = g["items"][0]
+        name = it["filename"] or "بدون اسم"
+        size_mb = it["size"] / (1024 * 1024)
+        dur = it["duration"] or 0
+        dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur > 0 else ""
+        extra = f" ({size_mb:.0f}MB" + (f" — {dur_str})" if dur_str else ")")
+        lines.append(f"{i}. 🎬 `{name}`{extra} × {len(g['items'])} نسخه")
+    if len(groups) > 10:
+        lines.append(f"… و {len(groups) - 10} گروه دیگر")
+
+    lines.append("")
+    lines.append("از هر گروه فقط قدیمی‌ترین نسخه می‌مونه. حذف انجام بدم؟")
+
+    context.user_data["scan_groups_channel"] = channel_id
+    await status.edit_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard("scan_confirm_delete", "scan_cancel_delete"),
+    )
+    return ConversationHandler.END
+
+
+async def do_scan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str):
+    query = update.callback_query
+    status = await query.edit_message_text("⏳ در حال حذف تکراری‌ها...")
+    groups = await scanner.find_duplicates(channel_id)
+    if not groups:
+        await status.edit_text("چیزی برای حذف نیست.", reply_markup=scanner_menu(True))
+        return
+    ok, msg, deleted = await scanner.delete_duplicates(channel_id, groups)
+    await status.edit_text(msg, reply_markup=scanner_menu(True))
+
+
 @admin_only
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """نمایش تعداد کانفیگ‌های در صف"""
@@ -1490,6 +1708,12 @@ def setup_handlers(application: Application):
             WAIT_REMOVE_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_remove_channel)],
             WAIT_REMOVE_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_remove_sub)],
             WAIT_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_admin_id)],
+            WAIT_SCAN_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_scan_api_id)],
+            WAIT_SCAN_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_scan_api_hash)],
+            WAIT_SCAN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_scan_phone)],
+            WAIT_SCAN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_scan_code)],
+            WAIT_SCAN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_scan_password)],
+            WAIT_SCAN_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_scan_channel)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(callback_router)],
         allow_reentry=True,

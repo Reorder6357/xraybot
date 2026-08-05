@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     github_token: Optional[str] = None
     github_repo: Optional[str] = None       # username/repo
 
+    # Telegram MTProto (اسکن کانال با Telethon)
+    tg_api_id: Optional[int] = None         # از my.telegram.org
+    tg_api_hash: Optional[str] = None
+
     # Runtime
     timezone: str = "Asia/Tehran"
     max_configs_per_run: int = 3000
