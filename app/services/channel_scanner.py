@@ -370,12 +370,32 @@ class ChannelScanner:
         name = re.sub(r"[\W_]+", "", name)
         return name
 
+    @staticmethod
+    def _dur_round(v) -> int:
+        """مدت رو به نزدیک‌ترین ثانیه گرد می‌کنه (نه truncate!)"""
+        try:
+            return int(float(v) + 0.5)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _size_bucket(size) -> int:
+        """حجم رو به سطل ۱ مگابایتی می‌بره — اختلاف چند کیلوبایتی (متادیتا) رو نادیده می‌گیره"""
+        try:
+            return int(size) // (1024 * 1024)
+        except Exception:
+            return 0
+
     async def find_duplicates(self, channel_id: str) -> dict:
         """
-        تشخیص تکراری در دو سطح:
-         - sure:    اسم نرمال‌شده یکسان، یا (حجم + مدت) یکسان → تقریباً قطعی
-         - suspect: فقط حجم یکسان (بدون اسم/مدت یکسان) → باید خودت چک کنی
-        برمی‌گردونه: {"sure": [گروه‌ها], "suspect": [گروه‌ها]}
+        تشخیص تکراری با تلورانس (برای کپی‌های دوباره‌آپلودشده):
+         - قطعی (sure):
+             a) اسم نرمال‌شده یکسان
+             b) مدت یکسان (گرد تا ثانیه) + حجم توی یه سطل ۱MB — یعنی همون فیلم، حتی اگه
+                چند کیلوبایت فرق داشته باشه (ریمیکس/متادیتا)
+         - مشکوک (suspect):
+             a) فقط حجم یکسان (سطل ۱MB) — مدت‌ها متفاوت
+             b) فقط مدت یکسان (گرد تا ۵ ثانیه) — حجم‌ها متفاوت (مثلاً کپی با کیفیت متفاوت)
         """
         rows = await db.get_scanned_files(channel_id)
         sure_groups: list[dict] = []
@@ -397,7 +417,8 @@ class ChannelScanner:
             if ra != rb:
                 parent[rb] = ra
 
-        # کلید ۱ (قطعی): اسم نرمال‌شده یکسان
+        # ---------- ادغام قطعی ----------
+        # a) اسم نرمال‌شده
         by_name: dict[str, list[int]] = {}
         for i, r in enumerate(rows):
             key = self._norm_filename(r["filename"] or "")
@@ -408,24 +429,22 @@ class ChannelScanner:
                 for j in idxs[1:]:
                     union(idxs[0], j)
 
-        # کلید ۲ (قطعی): حجم + مدت یکسان (هر دو > 0)
+        # b) (سطل حجم ۱MB + مدت گرد‌شده) — همون فیلم با اختلاف جزئی
         by_sd: dict[tuple, list[int]] = {}
         for i, r in enumerate(rows):
-            size = int(r["size"] or 0)
-            dur = float(r["duration"] or 0)
-            if size > 0 and dur > 0:
-                by_sd.setdefault((size, int(dur)), []).append(i)
+            size_b = self._size_bucket(r["size"] or 0)
+            dur = self._dur_round(r["duration"] or 0)
+            if size_b > 0 and dur > 0:
+                by_sd.setdefault((size_b, dur), []).append(i)
         for key, idxs in by_sd.items():
             if len(idxs) > 1:
                 for j in idxs[1:]:
                     union(idxs[0], j)
 
-        # ساخت گروه‌ها و تشخیص سطح
         groups_map: dict[int, list] = {}
         for i, r in enumerate(rows):
             groups_map.setdefault(find(i), []).append(r)
 
-        # فایل‌هایی که توی هیچ گروه قطعی نیفتادن
         in_sure = set()
         for root, items in groups_map.items():
             if len(items) < 2:
@@ -433,37 +452,82 @@ class ChannelScanner:
             items_sorted = sorted(items, key=lambda it: (it["date"] or 0, it["msg_id"]))
             names = {self._norm_filename(it["filename"] or "") for it in items}
             names.discard("")
-            sds = {(int(it["size"] or 0), int(float(it["duration"] or 0))) for it in items}
-            sds.discard((0, 0))
+            sd_keys = {(self._size_bucket(it["size"] or 0), self._dur_round(it["duration"] or 0)) for it in items}
+            sd_keys.discard((0, 0))
             same_name = len(names) < len(items)
-            same_sd = len(sds) < len(items)
+            same_sd = len(sd_keys) < len(items)
             if same_name or same_sd:
-                group = {
+                sure_groups.append({
                     "items": items_sorted,
                     "keep": items_sorted[0],
                     "dups": items_sorted[1:],
-                }
-                sure_groups.append(group)
+                })
                 for it in items:
                     in_sure.add(it["msg_id"])
 
-        # سطح مشکوک: فقط هم‌حجم (duration ثبت نشده) — جدا از گروه‌های قطعی
+        # ---------- مشکوک (روی باقی‌مانده‌ها) ----------
         remaining = [r for r in rows if r["msg_id"] not in in_sure]
-        by_size: dict[int, list] = {}
-        for r in remaining:
-            size = int(r["size"] or 0)
-            if size > 0:
-                by_size.setdefault(size, []).append(r)
-        for size, items in by_size.items():
-            if len(items) < 2:
-                continue
-            # اگه اسم‌ها هم یکسان بودن، قطعی بود؛ پس اینجا حتماً متفاوتن → مشکوک
-            items_sorted = sorted(items, key=lambda it: (it["date"] or 0, it["msg_id"]))
-            suspect_groups.append({
-                "items": items_sorted,
-                "keep": items_sorted[0],
-                "dups": items_sorted[1:],
-            })
+        if len(remaining) >= 2:
+            m = len(remaining)
+            parent2 = list(range(m))
+
+            def find2(i):
+                while parent2[i] != i:
+                    parent2[i] = parent2[parent2[i]]
+                    i = parent2[i]
+                return i
+
+            def union2(a, b):
+                ra, rb = find2(a), find2(b)
+                if ra != rb:
+                    parent2[rb] = ra
+
+            # سطل حجم
+            by_size: dict[int, list[int]] = {}
+            for i, r in enumerate(remaining):
+                b = self._size_bucket(r["size"] or 0)
+                if b > 0:
+                    by_size.setdefault(b, []).append(i)
+            for b, idxs in by_size.items():
+                if len(idxs) > 1:
+                    for j in idxs[1:]:
+                        union2(idxs[0], j)
+
+            # مدت گرد تا ۵ ثانیه (بخشنده‌تر برای مشکوک)
+            by_dur: dict[int, list[int]] = {}
+            for i, r in enumerate(remaining):
+                d = self._dur_round(r["duration"] or 0) // 5
+                if d > 0:
+                    by_dur.setdefault(d, []).append(i)
+            for d, idxs in by_dur.items():
+                if len(idxs) > 1:
+                    for j in idxs[1:]:
+                        union2(idxs[0], j)
+
+            groups2: dict[int, list] = {}
+            for i, r in enumerate(remaining):
+                groups2.setdefault(find2(i), []).append(r)
+
+            for root, items in groups2.items():
+                if len(items) < 2:
+                    continue
+                items_sorted = sorted(items, key=lambda it: (it["date"] or 0, it["msg_id"]))
+                size_buckets = {self._size_bucket(it["size"] or 0) for it in items}
+                size_buckets.discard(0)
+                durs = {self._dur_round(it["duration"] or 0) // 5 for it in items}
+                durs.discard(0)
+                same_size = len(size_buckets) < len(items)
+                same_dur = len(durs) < len(items)
+                if not (same_size or same_dur):
+                    continue
+                suspect_groups.append({
+                    "items": items_sorted,
+                    "keep": items_sorted[0],
+                    "dups": items_sorted[1:],
+                    "reason": ("حجم یکسان" if same_size and not same_dur
+                               else "مدت یکسان" if same_dur and not same_size
+                               else "حجم و مدت نزدیک"),
+                })
 
         sure_groups.sort(key=lambda g: len(g["dups"]), reverse=True)
         suspect_groups.sort(key=lambda g: len(g["dups"]), reverse=True)
