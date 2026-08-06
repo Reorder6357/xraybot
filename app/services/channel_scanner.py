@@ -710,6 +710,65 @@ class ChannelScanner:
             return False, f"❌ خطا در حذف: {str(e)[:150]}", 0
 
 
+    async def reset_admin_filter(self, peer: str, hints: Optional[dict] = None) -> tuple[bool, str]:
+        """تلاش برای روشن کردن «فیلتر اکشن ادمین» با جابه‌جایی ادمین اسکنر:
+        - ادمین رو بردار (EditAdmin با rights=0)
+        - دوباره اضافه کن (با همون دسترسی‌ها) → تلگرام فیلتر رو پیش‌فرض روشن می‌کنه
+        برمی‌گردونه: (موفق, پیام)"""
+        try:
+            await self.ensure_connected()
+            if not await self._client.is_user_authorized():
+                return False, "❌ وارد نشده‌ای"
+            entity = await self._resolve_entity(peer, hints)
+
+            me = await self._client.get_me()
+            if me is None:
+                return False, "❌ اکانت اسکنر پیدا نشد"
+
+            from telethon.tl.functions.channels import (
+                GetParticipantRequest, EditAdminRequest,
+            )
+            from telethon.tl.types import ChannelAdminRights, InputUser
+
+            # دسترسی‌های فعلی ادمین اسکنر
+            try:
+                part = await self._client(GetParticipantRequest(
+                    channel=entity, participant=InputUser(me.id, me.access_hash)
+                ))
+                rights = part.participant.admin_rights
+            except Exception as e:
+                return False, f"❌ اکانت اسکنر ادمین کانال نیست: {str(e)[:80]}"
+
+            # ۱) حذف ادمین (با rights خالی)
+            try:
+                await self._client(EditAdminRequest(
+                    channel=entity,
+                    user_id=InputUser(me.id, me.access_hash),
+                    admin_rights=ChannelAdminRights(),
+                    rank="",
+                ))
+            except Exception as e:
+                return False, f"❌ حذف ادمین نشد: {str(e)[:80]}"
+
+            # ۲) دوباره اضافه کن (با دسترسی‌های قبلی)
+            try:
+                await self._client(EditAdminRequest(
+                    channel=entity,
+                    user_id=InputUser(me.id, me.access_hash),
+                    admin_rights=rights,
+                    rank="",
+                ))
+            except Exception as e:
+                return False, f"❌ اضافه دوباره نشد (دستی اضافه کن): {str(e)[:80]}"
+
+            return True, (
+                "✅ ادمین اسکنر جابه‌جا شد — فیلتر اکشنش باید روشن شده باشه.\n"
+                "حالا «♻️ بازیابی» رو دوباره بزن."
+            )
+        except Exception as e:
+            logger.exception("reset_admin_filter failed")
+            return False, f"❌ خطا: {str(e)[:120]}"
+
     # ---------- بازیابی فیلم‌های پاک‌شده (از Recent Actions / Admin Log) ----------
     async def scan_deleted_media(self, peer: str, hints: Optional[dict] = None, max_events: int = 300):
         """بررسی Admin Log برای پیام‌های حذف‌شده با مدیا (فیلم/فایل).

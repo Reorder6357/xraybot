@@ -543,6 +543,57 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    if data == "scan_reset_filter":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if not rows:
+            await query.edit_message_text(
+                "اول یه کانال ثبت کن (فوروارد یا آیدی) بعد این کار رو بکن.",
+                reply_markup=back_only(),
+            )
+            return
+        kb_rows = [
+            [InlineKeyboardButton(
+                f"🔧 {_esc(str(rows[i]['title'] or rows[i]['chat_id']))[:25]}",
+                callback_data=f"scan_resetf_{i}"
+            )]
+            for i in range(min(len(rows), 8))
+        ]
+        kb_rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_scanner")])
+        await query.edit_message_text(
+            "🔧 برای اینکه حذف‌ها توی Recent Actions ثبت بشن، ادمین اسکنر باید «فیلتر اکشن» روشن داشته باشه.\n"
+            "ربات ادمین اسکنر رو «جابه‌جا» می‌کنه (حذف و اضافه دوباره) تا تلگرام فیلتر رو روشن کنه.\n"
+            "⚠️ این کار چند ثانیه‌ای ادمین رو قطع می‌کنه ولی دسترسی‌هاش حفظ می‌شه.\n\n"
+            "کدوم کانال؟",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+        return
+
+    if data.startswith("scan_resetf_"):
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        try:
+            idx = int(data.split("_")[2])
+        except ValueError:
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if idx < 0 or idx >= len(rows):
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        ch = rows[idx]
+        peer = ch["chat_id"]
+        hints = {"id": ch["chat_id"], "title": ch["title"] or "", "username": ch["username"] or ""}
+        if ch["username"]:
+            peer = "@" + ch["username"]
+        status = await query.edit_message_text("🔧 در حال جابه‌جایی ادمین اسکنر...")
+        ok, msg = await scanner.reset_admin_filter(peer, hints)
+        await status.edit_text(msg, reply_markup=scanner_menu(True))
+        return
+
     if data == "scan_recover":
         if not settings.is_admin(user_id):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)

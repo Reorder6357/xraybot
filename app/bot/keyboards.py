@@ -19,6 +19,7 @@ def scanner_menu(login_status: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 کانال‌های ثبت‌شده", callback_data="scan_channels_list")],
         [InlineKeyboardButton("♻️ بازیابی فیلم‌های پاک‌شده", callback_data="scan_recover")],
+        [InlineKeyboardButton("🔧 روشن کردن فیلتر اکشن (برای بازیابی)", callback_data="scan_reset_filter")],
         [InlineKeyboardButton(btn1, callback_data="scan_login")],
     ]
     if login_status:
