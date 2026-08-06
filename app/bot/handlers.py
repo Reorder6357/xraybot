@@ -633,9 +633,12 @@ async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TY
     peer = update.effective_message.text.strip()
     status = await update.effective_message.reply_text("⏳ در حال اسکن کانال... (ممکنه چند دقیقه طول بکشه)")
 
-    async def progress(count):
+    async def progress(value):
         try:
-            await status.edit_text(f"⏳ در حال اسکن... {count} پیام بررسی شد")
+            if isinstance(value, int):
+                await status.edit_text(f"⏳ در حال اسکن... {value} پیام بررسی شد")
+            else:
+                await status.edit_text(str(value))
         except Exception:
             pass
 
@@ -780,9 +783,12 @@ async def _start_scan_for_peer(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.bot_data["scan_running"] = True
     try:
-        async def progress(count):
+        async def progress(value):
             try:
-                await status.edit_text(f"⏳ در حال اسکن... {count} پیام بررسی شد")
+                if isinstance(value, int):
+                    await status.edit_text(f"⏳ در حال اسکن... {value} پیام بررسی شد")
+                else:
+                    await status.edit_text(str(value))
             except Exception:
                 pass
 

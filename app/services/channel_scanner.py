@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Optional
 
 from telethon import TelegramClient
@@ -16,6 +17,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
+    FloodWaitError,
 )
 from telethon.tl.types import (
     DocumentAttributeFilename,
@@ -179,66 +181,117 @@ class ChannelScanner:
             files: list[dict] = []
             count = 0
             stats = {"video": 0, "doc": 0, "gif": 0, "photo": 0, "text": 0, "other": 0}
-            async for msg in self._client.iter_messages(entity, limit=max_messages, wait_time=0):
-                media = None
-                if msg.document:
-                    media = ("doc", msg.document)
-                elif msg.video:
-                    media = ("video", msg.video)
-                elif getattr(msg, "gif", None):
-                    media = ("gif", msg.gif)
-                elif msg.photo:
-                    media = ("photo", msg.photo)
 
-                if media:
-                    kind, m = media
-                    stats[kind] = stats.get(kind, 0) + 1
-                    filename = ""
-                    duration = 0.0
-                    is_video = kind in ("video", "gif")
-                    size = 0
+            # ---- صفحه‌بندی دستی (مقاوم در برابر FloodWait و قفل‌شدن) ----
+            SCAN_TIME_CAP = 20 * 60  # سقف ۲۰ دقیقه — هیچ‌وقت بی‌نهایت صبر نمی‌کنه
+            CHUNK = 100
+            t_start = time.time()
+            offset_id = 0
+            capped = False
 
-                    if kind == "doc":
-                        for attr in m.attributes:
-                            if isinstance(attr, DocumentAttributeFilename):
-                                filename = attr.file_name or ""
-                            elif isinstance(attr, DocumentAttributeVideo):
-                                duration = float(attr.duration or 0)
-                                is_video = True
-                        size = m.size or 0
-                    elif kind in ("video", "gif"):
-                        # ویدیوهای ارسال‌شده به‌صورت ویدیو اسم فایل مستقیم ندارن
-                        filename = ""
-                        duration = float(getattr(m, "duration", 0) or 0)
-                        size = getattr(m, "size", 0) or 0
-                    elif kind == "photo":
-                        # سایز عکس از بزرگترین سایزش
+            while True:
+                # سقف زمانی
+                if time.time() - t_start > SCAN_TIME_CAP:
+                    capped = True
+                    break
+                # سقف تعداد
+                if max_messages and count >= max_messages:
+                    break
+
+                try:
+                    batch = await self._client.get_messages(
+                        entity, limit=CHUNK, offset_id=offset_id
+                    )
+                except FloodWaitError as e:
+                    secs = int(getattr(e, "seconds", 30) or 30)
+                    logger.warning(f"FloodWait {secs}s while scanning (at {count})")
+                    if progress_cb:
                         try:
-                            sizes = getattr(m, "sizes", [])
-                            if sizes:
-                                size = getattr(sizes[-1], "size", 0) or 0
+                            await progress_cb(
+                                f"⚠️ محدودیت تلگرام — {secs} ثانیه صبر کن... (تا الان {count} پیام)"
+                            )
                         except Exception:
                             pass
+                    await asyncio.sleep(min(secs, 120))
+                    continue
+                except Exception as e:
+                    logger.warning(f"get_messages failed at {count}: {e}")
+                    break
 
-                    files.append({
-                        "msg_id": msg.id,
-                        "filename": filename,
-                        "size": size,
-                        "duration": duration,
-                        "is_video": is_video,
-                        "date": msg.date.timestamp() if msg.date else 0,
-                    })
-                else:
-                    # بدون مدیا: متن یا سایر
-                    if msg.text:
-                        stats["text"] += 1
+                if not batch:
+                    break
+
+                for msg in batch:
+                    if not isinstance(msg, Message):
+                        continue
+                    media = None
+                    if msg.document:
+                        media = ("doc", msg.document)
+                    elif msg.video:
+                        media = ("video", msg.video)
+                    elif getattr(msg, "gif", None):
+                        media = ("gif", msg.gif)
+                    elif msg.photo:
+                        media = ("photo", msg.photo)
+
+                    if media:
+                        kind, m = media
+                        stats[kind] = stats.get(kind, 0) + 1
+                        filename = ""
+                        duration = 0.0
+                        is_video = kind in ("video", "gif")
+                        size = 0
+
+                        if kind == "doc":
+                            for attr in m.attributes:
+                                if isinstance(attr, DocumentAttributeFilename):
+                                    filename = attr.file_name or ""
+                                elif isinstance(attr, DocumentAttributeVideo):
+                                    duration = float(attr.duration or 0)
+                                    is_video = True
+                            size = m.size or 0
+                        elif kind in ("video", "gif"):
+                            filename = ""
+                            duration = float(getattr(m, "duration", 0) or 0)
+                            size = getattr(m, "size", 0) or 0
+                        elif kind == "photo":
+                            try:
+                                sizes = getattr(m, "sizes", [])
+                                if sizes:
+                                    size = getattr(sizes[-1], "size", 0) or 0
+                            except Exception:
+                                pass
+
+                        files.append({
+                            "msg_id": msg.id,
+                            "filename": filename,
+                            "size": size,
+                            "duration": duration,
+                            "is_video": is_video,
+                            "date": msg.date.timestamp() if msg.date else 0,
+                        })
                     else:
-                        stats["other"] += 1
-                count += 1
+                        if msg.text:
+                            stats["text"] += 1
+                        else:
+                            stats["other"] += 1
+                    count += 1
+
+                # آفست برای صفحه بعد
+                offset_id = batch[-1].id
+                if len(batch) < CHUNK:
+                    break
+
                 if progress_cb and count % SCAN_BATCH_PROGRESS == 0:
                     await progress_cb(count)
                 if count % 500 == 0:
                     logger.info(f"Scan progress: {count} messages, {len(files)} files so far")
+
+                # ریتم ملایم (جلوگیری از FloodWait)
+                await asyncio.sleep(0.4)
+
+            if capped:
+                logger.warning("Scan capped by time limit")
 
             await db.add_scanned_files(channel_id, files)
 
