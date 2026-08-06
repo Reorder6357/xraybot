@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # Telegram MTProto (اسکن کانال با Telethon)
     tg_api_id: Optional[int] = None         # از my.telegram.org
     tg_api_hash: Optional[str] = None
+    scanner_phone: Optional[str] = None     # شماره اکانت اسکنر (برای نمایش و پیش‌فرض)
 
     # Runtime
     timezone: str = "Asia/Tehran"

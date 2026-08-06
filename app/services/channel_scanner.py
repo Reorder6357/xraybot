@@ -63,11 +63,47 @@ class ChannelScanner:
         except Exception:
             return False
 
+    async def get_login_info(self) -> str:
+        """اطلاعات اکانت واردشده (برای نمایش: اسم + شماره)"""
+        try:
+            await self.ensure_connected()
+            if not await self._client.is_user_authorized():
+                return ""
+            me = await self._client.get_me()
+            if me is None:
+                return ""
+            parts = [me.first_name or ""]
+            if getattr(me, "username", None):
+                parts.append("@" + me.username)
+            phone = getattr(me, "phone", None)
+            if phone:
+                parts.append("+" + str(phone))
+            return " ".join(x for x in parts if x)
+        except Exception:
+            return ""
+
+    async def disconnect(self):
+        """بستن اتصال و ذخیره سشن (قبل از خاموشی)"""
+        try:
+            if self._client is not None and self._client.is_connected():
+                await self._client.disconnect()
+                self._client = None
+        except Exception:
+            pass
+
     # ---------- لاگین ----------
     async def request_code(self, phone: str) -> tuple[bool, str]:
         try:
             await self.ensure_connected()
             await self._client.send_code_request(phone)
+            # ذخیره شماره برای دفعات بعد
+            try:
+                from app.core.config import settings as _s
+                from app.core.database import db as _db
+                _s.scanner_phone = phone
+                await _db.set_setting("scanner_phone", phone)
+            except Exception:
+                pass
             return True, f"کد تأیید به {phone} فرستاده شد. کد ۵ رقمی رو بفرست:"
         except Exception as e:
             return False, f"❌ خطا: {str(e)[:120]}"
@@ -77,6 +113,10 @@ class ChannelScanner:
         try:
             await self.ensure_connected()
             await self._client.sign_in(phone, code.strip())
+            try:
+                await self._client.session.save()
+            except Exception:
+                pass
             return True, "✅ ورود موفق شد!", False
         except SessionPasswordNeededError:
             return True, "🔐 رمز دومرحله‌ای (پسورد) رو بفرست:", True

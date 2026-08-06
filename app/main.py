@@ -15,8 +15,10 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 from jinja2 import Environment
+from pydantic import BaseModel
 from telegram.ext import Application
 
 from app.core.config import settings, DATA_DIR
@@ -43,6 +45,9 @@ async def load_runtime_settings():
     admins = await db.get_setting("admin_ids") or []
     gh_token = await db.get_setting("github_token")
     gh_repo = await db.get_setting("github_repo")
+    tg_id = await db.get_setting("tg_api_id")
+    tg_hash = await db.get_setting("tg_api_hash")
+    tg_phone = await db.get_setting("scanner_phone")
 
     if token:
         settings.bot_token = token
@@ -54,6 +59,12 @@ async def load_runtime_settings():
         settings.github_token = gh_token
     if gh_repo:
         settings.github_repo = gh_repo
+    if tg_id:
+        settings.tg_api_id = int(tg_id)
+    if tg_hash:
+        settings.tg_api_hash = tg_hash
+    if tg_phone:
+        settings.scanner_phone = tg_phone
 
 
 async def get_or_create_setup_key() -> str:
@@ -163,12 +174,26 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
+        from app.services.channel_scanner import scanner
+        await scanner.disconnect()  # ذخیره سشن قبل از خاموشی
+    except Exception:
+        pass
+    try:
         await db.close()
     except Exception:
         pass
 
 
 app = FastAPI(title="Xray Config Bot", lifespan=lifespan)
+
+# CORS: تا صفحه HTML تست بتونه از مرورگر به API دسترسی داشته باشه
+# (دسترسی با توکن محافظت می‌شه؛ CORS فقط اجازه‌ی فراخوانی می‌ده)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # -------------------- Health --------------------
@@ -253,6 +278,58 @@ _JINJA = Environment(autoescape=True)
 
 def _render_setup(**kwargs) -> str:
     return _JINJA.from_string(SETUP_HTML).render(**kwargs)
+
+
+class TestRequest(BaseModel):
+    links: list[str] = []
+    concurrency: int = 20
+    timeout: float = 8.0
+
+
+@app.post("/api/test")
+async def api_test(req: TestRequest, request: Request):
+    """
+    API تست کانفیگ با Xray (برای صفحه HTML تست).
+    دسترسی فقط با توکن (X-API-Token = کلید راه‌اندازی).
+    """
+    # 🔐 احراز هویت با کلید راه‌اندازی
+    expected = await get_or_create_setup_key()
+    provided = request.headers.get("x-api-token", "")
+    if not secrets.compare_digest(provided.strip(), expected):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if not req.links:
+        return JSONResponse({"error": "empty_links"}, status_code=400)
+
+    links = [l for l in req.links if isinstance(l, str) and l.strip()][:200]
+    if not links:
+        return JSONResponse({"error": "no_valid_links"}, status_code=400)
+
+    from app.services.xray_tester import test_batch
+
+    results = await test_batch(
+        links,
+        concurrency=max(1, min(int(req.concurrency or 20), 25)),
+        timeout=max(2.0, min(float(req.timeout or 8.0), 15.0)),
+    )
+
+    return {
+        "total": len(results),
+        "success": sum(1 for r in results if r.success),
+        "results": [
+            {
+                "link": r.link,
+                "success": r.success,
+                "latency_ms": r.latency_ms,
+                "country_code": r.country_code,
+                "country_name": r.country_name,
+                "exit_ip": r.exit_ip,
+                "error": r.error,
+                "speed_kbps": r.speed_kbps,
+            }
+            for r in results
+        ],
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

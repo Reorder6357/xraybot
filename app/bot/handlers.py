@@ -716,11 +716,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- Scanner section ----
     if data == "menu_scanner":
         logged = await scanner.is_logged_in()
+        info = ""
+        if logged:
+            who = await scanner.get_login_info()
+            info = f"\n👤 وارد شده با: `{who}`" if who else ""
         status = "✅ وارد شده‌اید" if logged else "❌ هنوز وارد نشده‌اید"
         await query.edit_message_text(
-            f"📡 اسکن کانال برای پیدا کردن فایل‌های تکراری\n\n{status}\n\n"
+            f"📡 اسکن کانال برای پیدا کردن فایل‌های تکراری\n\n{status}{info}\n\n"
             f"برای اسکن کامل تاریخچه کانال (اسم فایل، حجم، مدت ویدیو) به یه اکانت تلگرام نیازه.\n"
             f"اول ورود، بعد اسکن.",
+            parse_mode="Markdown",
             reply_markup=scanner_menu(logged),
         )
         return
@@ -729,17 +734,34 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not settings.is_admin(user_id):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
-        # چک api_id/api_hash
-        if not settings.tg_api_id or not settings.tg_api_hash:
+        # اگه از قبل وارد شده → نیازی به لاگین مجدد نیست
+        if await scanner.is_logged_in():
+            who = await scanner.get_login_info()
+            await query.edit_message_text(
+                f"✅ شما قبلاً وارد شده‌اید ({who}).\n"
+                f"لازم نیست دوباره لاگین کنی — مستقیم «📡 اسکن کانال» رو بزن.\n"
+                f"اگه می‌خوای حساب عوض کنی، اول «🗑 پاک کردن سشن» رو بزن.",
+                reply_markup=scanner_menu(True),
+            )
+            return
+        # چک api_id/api_hash (از حافظه یا دیتابیس)
+        api_id = settings.tg_api_id or await db.get_setting("tg_api_id")
+        api_hash = settings.tg_api_hash or await db.get_setting("tg_api_hash")
+        if not api_id or not api_hash:
             await query.edit_message_text(
                 "🔑 اول api_id و api_hash لازمه (از my.telegram.org می‌گیری).\n"
                 "api_id رو بفرست:",
                 reply_markup=back_only(),
             )
             return WAIT_SCAN_API_ID
+        settings.tg_api_id = int(api_id)
+        settings.tg_api_hash = api_hash
+        # شماره قبلی رو پیشنهاد بده
+        saved_phone = settings.scanner_phone or await db.get_setting("scanner_phone")
+        hint = f"\n(شماره قبلی: `{saved_phone}` — همون رو بفرست یا جدید)" if saved_phone else ""
         await query.edit_message_text(
-            "📱 شماره تلفن اکانت اسکنر رو با فرمت بین‌المللی بفرست:\n"
-            "مثال: `+989123456789`",
+            f"📱 شماره تلفن اکانت اسکنر رو با فرمت بین‌المللی بفرست:{hint}\n"
+            f"مثال: `+989123456789`",
             parse_mode="Markdown",
             reply_markup=back_only(),
         )
@@ -754,6 +776,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_only(),
         )
         return WAIT_SCAN_CHANNEL
+
+    if data == "scan_logout":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        ok = await scanner.logout()
+        await query.edit_message_text(
+            "🚪 از حساب اسکنر خارج شدی." if ok else "⚠️ مشکلی پیش اومد (شاید از قبل خارج شده بودی).",
+            reply_markup=scanner_menu(False),
+        )
+        return
 
     if data == "scan_clear_data":
         await db.clear_scanned_files()

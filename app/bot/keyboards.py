@@ -143,12 +143,15 @@ def github_menu() -> InlineKeyboardMarkup:
 
 def scanner_menu(login_status: bool = False) -> InlineKeyboardMarkup:
     btn1 = "🔑 ورود با شماره (لاگین)" if not login_status else "✅ وارد شده‌اید"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(btn1, callback_data="scan_login")],
         [InlineKeyboardButton("📡 اسکن کانال", callback_data="scan_channel")],
-        [InlineKeyboardButton("🗑 پاک کردن داده اسکن", callback_data="scan_clear_data")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")],
-    ])
+    ]
+    if login_status:
+        rows.append([InlineKeyboardButton("🚪 خروج از حساب اسکنر", callback_data="scan_logout")])
+    rows.append([InlineKeyboardButton("🗑 پاک کردن داده اسکن", callback_data="scan_clear_data")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def confirm_keyboard(yes_data: str, no_data: str = "back_main") -> InlineKeyboardMarkup:
