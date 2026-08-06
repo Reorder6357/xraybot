@@ -150,6 +150,7 @@ class ChannelScanner:
         peer: str,
         progress_cb=None,
         max_messages: int = 100000,
+        hints: Optional[dict] = None,
     ) -> tuple[bool, str, int]:
         """
         اسکن کامل کانال و ذخیره متادیتای فایل‌ها در دیتابیس.
@@ -160,7 +161,7 @@ class ChannelScanner:
             if not await self._client.is_user_authorized():
                 return False, "❌ اول باید با شماره وارد بشی (دکمه ورود)", 0
 
-            entity = await self._resolve_entity(peer)
+            entity = await self._resolve_entity(peer, hints)
             channel_id = str(entity.id)
             chan_title = getattr(entity, "title", "") or ""
             chan_uname = getattr(entity, "username", "")
@@ -269,32 +270,86 @@ class ChannelScanner:
             logger.exception("scan_channel failed")
             return False, f"❌ خطا در اسکن: {str(e)[:150]}", 0
 
-    async def _resolve_entity(self, peer: str):
-        """پیدا کردن کانال با انعطاف: آیدی عددی، یوزرنیم، یا لینک t.me"""
+    @staticmethod
+    def _norm_id(raw) -> Optional[int]:
+        """نرمال‌سازی آیدی کانال (حذف -100 پیشوند)"""
+        try:
+            return int(str(raw).replace("-100", "").replace("-", ""))
+        except Exception:
+            return None
+
+    async def _resolve_entity(self, peer: str, hints: Optional[dict] = None):
+        """
+        پیدا کردن کانال با هر روش ممکن:
+        ۱) get_entity مستقیم (آیدی/یوزرنیم/لینک)
+        ۲) ResolveUsername برای کانال‌های عمومی
+        ۳) جستجو در گفتگوهای اکانت اسکنر (برای کانال‌های خصوصی که ادمینشه)
+        """
         entity = None
+
+        # ۱) مستقیم
         try:
             entity = await self._client.get_entity(peer)
         except Exception:
-            # تبدیل لینک به یوزرنیم
+            entity = None
+
+        # ۲) یوزرنیم / لینک
+        if entity is None and peer:
             clean = peer.strip()
             if clean.startswith("https://t.me/"):
                 clean = clean.replace("https://t.me/", "").split("/")[0]
-            if not clean.startswith("@") and not clean.startswith("-"):
+            if clean and not clean.startswith("@") and not clean.lstrip("-").isdigit():
                 clean = "@" + clean
             try:
                 entity = await self._client.get_entity(clean)
             except Exception:
-                # آخرین راه: resolve username
-                from telethon.tl.functions.contacts import ResolveUsernameRequest
-                clean2 = clean.lstrip("@")
+                entity = None
+            if entity is None and clean.lstrip("@") and not clean.lstrip("-").isdigit():
                 try:
-                    res = await self._client(ResolveUsernameRequest(clean2))
-                    entity = res.chats[0] if res.chats else None
+                    from telethon.tl.functions.contacts import ResolveUsernameRequest
+                    res = await self._client(ResolveUsernameRequest(clean.lstrip("@")))
+                    if res.chats:
+                        entity = res.chats[0]
                 except Exception:
                     entity = None
+
+        # ۳) جستجو در گفتگوهای اکانت (پوشش کانال‌های خصوصی)
         if entity is None:
+            target_id = None
+            target_title = None
+            if hints:
+                target_id = self._norm_id(hints.get("id"))
+                target_title = str(hints.get("title") or "").strip()
+            if peer:
+                p = peer.strip()
+                if p.lstrip("-").isdigit():
+                    target_id = self._norm_id(p)
+                elif p.startswith("@"):
+                    pass  # یوزرنیم — با اسم تطبیق می‌دیم
+            try:
+                async for d in self._client.iter_dialogs():
+                    ent = d.entity
+                    eid = getattr(ent, "id", None)
+                    eid_norm = self._norm_id(eid)
+                    uname = getattr(ent, "username", None)
+                    title = str(getattr(ent, "title", "") or "")
+                    if target_id is not None and eid_norm == target_id:
+                        entity = ent
+                        break
+                    if target_title and title.strip() == target_title:
+                        entity = ent
+                        break
+                    if peer and peer.startswith("@") and uname and ("@" + uname) == peer:
+                        entity = ent
+                        break
+            except Exception as e:
+                logger.warning(f"dialog search failed: {e}")
+
+        if entity is None:
+            name = str((hints or {}).get("title") or "") or peer or "؟"
             raise RuntimeError(
-                "کانال پیدا نشد. مطمئن شو اکانت اسکنر توی اون کانال عضوه یا یه پیام ازش فوروارد کن."
+                f"کانال «{name}» پیدا نشد. مطمئن شو اکانت اسکنر توی اون کانال عضوه/ادمینه "
+                f"و با همون اکانت یه بار توی تلگرام کانال رو باز کرده باشی."
             )
         return entity
 

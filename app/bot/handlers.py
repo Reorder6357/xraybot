@@ -683,17 +683,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
         peer = context.user_data.get("last_forward_peer", "")
+        hints = context.user_data.get("last_forward_hints") or {}
         if not peer:
             await query.answer("اول یه پیام از کانال فوروارد کن", show_alert=True)
             return
-        await query.edit_message_text(f"⏳ در حال اسکن کانال «{peer}»...")
+        await query.edit_message_text(f"⏳ در حال اسکن کانال «{hints.get('title') or peer}»...")
         status = query.message
         async def progress(count):
             try:
                 await status.edit_text(f"⏳ در حال اسکن... {count} پیام بررسی شد")
             except Exception:
                 pass
-        ok, msg, nfiles = await scanner.scan_channel(peer, progress_cb=progress)
+        ok, msg, nfiles = await scanner.scan_channel(peer, progress_cb=progress, hints=hints)
         await query.edit_message_text(msg, reply_markup=scanner_menu(await scanner.is_logged_in()))
         return
 
@@ -1269,6 +1270,8 @@ async def handle_media_caption(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     total_pending = await db.count_pending()
     context.user_data["last_extracted_links"] = links
+    if source == "forward":
+        context.user_data["last_forward_hints"] = _forward_hints(message)
 
     lines = [
         f"✅ استخراج از کپشن انجام شد",
