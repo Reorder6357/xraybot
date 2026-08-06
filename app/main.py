@@ -1,7 +1,7 @@
 """
 نقطه ورود اصلی:
 - FastAPI برای صفحه setup اولیه + healthcheck
-- ربات تلگرام
+- ربات تلگرام (اسکن کانال + دیپلوی)
 """
 
 from __future__ import annotations
@@ -15,19 +15,15 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Form, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from jinja2 import Environment
-from pydantic import BaseModel
 from telegram.ext import Application
 
 from app.core.config import settings, DATA_DIR
 from app.core.database import db
 from app.bot.handlers import setup_handlers
 from app.services.github_deploy import github_deployer
-from app.services.scheduler import (
-    set_bot_app, start_scheduler, stop_scheduler, reload_schedule
-)
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -67,38 +63,6 @@ async def load_runtime_settings():
         settings.scanner_phone = tg_phone
 
 
-async def get_or_create_setup_key() -> str:
-    """کلید محافظت از صفحه راه‌اندازی.
-    اولویت: env SETUP_KEY > کلید ذخیره‌شده در دیتابیس > ساخت کلید جدید (یک بار نمایش داده می‌شه)."""
-    env_key = os.environ.get("SETUP_KEY", "").strip()
-    if env_key:
-        return env_key
-    stored = await db.get_setting("setup_key")
-    if stored:
-        return stored
-    key = secrets.token_urlsafe(16)
-    await db.set_setting("setup_key", key)
-    return key
-
-
-async def verify_setup_key(provided: str) -> bool:
-    expected = await get_or_create_setup_key()
-    return secrets.compare_digest(provided.strip(), expected)
-
-
-async def validate_bot_token(token: str) -> tuple[bool, str]:
-    """اعتبارسنجی توکن با getMe قبل از ذخیره"""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"https://api.telegram.org/bot{token}/getMe")
-            if r.status_code == 200 and r.json().get("ok"):
-                bot = r.json().get("result", {})
-                return True, f"🤖 @{bot.get('username', '')} — {bot.get('first_name', '')}"
-            return False, "توکن نامعتبر است (پاسخ تلگرام: ناموفق)."
-    except Exception as e:
-        return False, f"خطا در ارتباط با تلگرام: {e}"
-
-
 async def start_bot():
     global bot_app
     if not settings.bot_token:
@@ -115,14 +79,12 @@ async def start_bot():
         setup_handlers(bot_app)
         await bot_app.initialize()
         await bot_app.start()
-        # drop_pending_updates=False: اگه پیام موقع ری‌استارت/آپدیت بیاد گم نشه
-        # (مثلاً کانفیگی که موقع دیپلوی Railway فرستاده می‌شه)
+        # drop_pending_updates=False: پیام موقع ری‌استارت گم نشه
         await bot_app.updater.start_polling(drop_pending_updates=False)
         logger.info("Telegram bot started.")
     except Exception as e:
         logger.error(f"Failed to start Telegram bot: {e}")
         bot_app = None
-        # صفحه وب باید همچنان کار کند حتی اگر توکن اشتباه باشد
 
 
 async def stop_bot():
@@ -143,7 +105,6 @@ async def stop_bot():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup — خطا در ربات نباید کل سرویس را بخواباند
     try:
         await db.connect()
         await load_runtime_settings()
@@ -152,30 +113,19 @@ async def lifespan(app: FastAPI):
 
     try:
         await start_bot()
-        set_bot_app(bot_app)
     except Exception as e:
         logger.error(f"Bot start error (web UI still available): {e}")
 
-    try:
-        start_scheduler()
-        await reload_schedule()
-    except Exception as e:
-        logger.error(f"Scheduler error: {e}")
-
     yield
 
-    # Shutdown
-    try:
-        stop_scheduler()
-    except Exception:
-        pass
     try:
         await stop_bot()
     except Exception:
         pass
     try:
+        # ذخیره سشن اسکنر قبل از خاموشی
         from app.services.channel_scanner import scanner
-        await scanner.disconnect()  # ذخیره سشن قبل از خاموشی
+        await scanner.disconnect()
     except Exception:
         pass
     try:
@@ -184,16 +134,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="Xray Config Bot", lifespan=lifespan)
-
-# CORS: تا صفحه HTML تست بتونه از مرورگر به API دسترسی داشته باشه
-# (دسترسی با توکن محافظت می‌شه؛ CORS فقط اجازه‌ی فراخوانی می‌ده)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Xray Scanner Bot", lifespan=lifespan)
 
 
 # -------------------- Health --------------------
@@ -204,6 +145,11 @@ async def health():
         "bot_configured": settings.is_configured(),
         "owner_id": settings.owner_id,
     }
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 
 # -------------------- Setup Web UI --------------------
@@ -233,7 +179,7 @@ SETUP_HTML = """
 </head>
 <body>
   <div class="card">
-    <h1>🚀 تنظیمات ربات Xray</h1>
+    <h1>🚀 تنظیمات ربات</h1>
     {% if configured %}
       <div style="text-align:center"><span class="badge badge-on">فعال</span></div>
     {% else %}
@@ -272,7 +218,6 @@ SETUP_HTML = """
 </html>
 """
 
-
 _JINJA = Environment(autoescape=True)
 
 
@@ -280,56 +225,36 @@ def _render_setup(**kwargs) -> str:
     return _JINJA.from_string(SETUP_HTML).render(**kwargs)
 
 
-class TestRequest(BaseModel):
-    links: list[str] = []
-    concurrency: int = 20
-    timeout: float = 8.0
+async def get_or_create_setup_key() -> str:
+    """کلید محافظت از صفحه راه‌اندازی.
+    اولویت: env SETUP_KEY > کلید ذخیره‌شده در دیتابیس > ساخت کلید جدید (یک بار نمایش داده می‌شه)."""
+    env_key = os.environ.get("SETUP_KEY", "").strip()
+    if env_key:
+        return env_key
+    stored = await db.get_setting("setup_key")
+    if stored:
+        return stored
+    key = secrets.token_urlsafe(16)
+    await db.set_setting("setup_key", key)
+    return key
 
 
-@app.post("/api/test")
-async def api_test(req: TestRequest, request: Request):
-    """
-    API تست کانفیگ با Xray (برای صفحه HTML تست).
-    دسترسی فقط با توکن (X-API-Token = کلید راه‌اندازی).
-    """
-    # 🔐 احراز هویت با کلید راه‌اندازی
+async def verify_setup_key(provided: str) -> bool:
     expected = await get_or_create_setup_key()
-    provided = request.headers.get("x-api-token", "")
-    if not secrets.compare_digest(provided.strip(), expected):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return secrets.compare_digest(provided.strip(), expected)
 
-    if not req.links:
-        return JSONResponse({"error": "empty_links"}, status_code=400)
 
-    links = [l for l in req.links if isinstance(l, str) and l.strip()][:200]
-    if not links:
-        return JSONResponse({"error": "no_valid_links"}, status_code=400)
-
-    from app.services.xray_tester import test_batch
-
-    results = await test_batch(
-        links,
-        concurrency=max(1, min(int(req.concurrency or 20), 25)),
-        timeout=max(2.0, min(float(req.timeout or 8.0), 15.0)),
-    )
-
-    return {
-        "total": len(results),
-        "success": sum(1 for r in results if r.success),
-        "results": [
-            {
-                "link": r.link,
-                "success": r.success,
-                "latency_ms": r.latency_ms,
-                "country_code": r.country_code,
-                "country_name": r.country_name,
-                "exit_ip": r.exit_ip,
-                "error": r.error,
-                "speed_kbps": r.speed_kbps,
-            }
-            for r in results
-        ],
-    }
+async def validate_bot_token(token: str) -> tuple[bool, str]:
+    """اعتبارسنجی توکن با getMe قبل از ذخیره"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"https://api.telegram.org/bot{token}/getMe")
+            if r.status_code == 200 and r.json().get("ok"):
+                bot = r.json().get("result", {})
+                return True, f"🤖 @{bot.get('username', '')} — {bot.get('first_name', '')}"
+            return False, "توکن نامعتبر است (پاسخ تلگرام: ناموفق)."
+    except Exception as e:
+        return False, f"خطا در ارتباط با تلگرام: {e}"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -337,14 +262,12 @@ async def setup_page(request: Request):
     configured = settings.is_configured()
     fresh_key = None
     if configured:
-        # اگه کلیدی ذخیره نشده (مثلاً از نسخه قبلی آپگرید شده)،
-        # کلید جدید بساز و فقط همین یک بار نشون بده
         stored = await db.get_setting("setup_key")
         if not stored and not os.environ.get("SETUP_KEY", "").strip():
             fresh_key = await get_or_create_setup_key()
     html = _render_setup(
         configured=configured,
-        bot_token="",  # خالی می‌ذاریم تا کاربر توکن جدید رو کامل وارد کنه
+        bot_token="",
         owner_id=settings.owner_id or "",
         message=None,
         success=False,
@@ -397,13 +320,12 @@ async def do_setup(
 
     was_configured = configured
 
-    # ذخیره (هم برای اولین بار، هم برای ادیت)
+    # ذخیره
     await db.set_setting("bot_token", token)
     await db.set_setting("owner_id", owner_id)
     if not was_configured:
         await db.set_setting("admin_ids", [])
         settings.admin_ids = []
-        # ساخت کلید راه‌اندازی برای تغییرات بعدی
         await get_or_create_setup_key()
 
     settings.bot_token = token
@@ -413,7 +335,6 @@ async def do_setup(
     try:
         await stop_bot()
         await start_bot()
-        set_bot_app(bot_app)  # مهم: بدون این، زمان‌بندی به نمونه قدیمی اشاره می‌کنه
         if not was_configured:
             setup_key = await get_or_create_setup_key()
             msg = (
@@ -437,9 +358,3 @@ async def do_setup(
         success=ok,
     )
     return HTMLResponse(html)
-
-
-# برای Railway که گاهی از root استفاده می‌کنه
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}

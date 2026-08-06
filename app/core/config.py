@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # Bot
     bot_token: Optional[str] = None
     owner_id: Optional[int] = None          # فقط مدیر اصلی
-    admin_ids: list[int] = []               # ادمین‌های اضافی (فقط استفاده، نه ادیت حساس)
+    admin_ids: list[int] = []               # ادمین‌های اضافی
 
     # GitHub deploy
     github_token: Optional[str] = None
@@ -44,21 +44,10 @@ class Settings(BaseSettings):
     # Telegram MTProto (اسکن کانال با Telethon)
     tg_api_id: Optional[int] = None         # از my.telegram.org
     tg_api_hash: Optional[str] = None
-    scanner_phone: Optional[str] = None     # شماره اکانت اسکنر (برای نمایش و پیش‌فرض)
-
-    # Runtime
-    timezone: str = "Asia/Tehran"
-    max_configs_per_run: int = 3000
-    test_concurrency: int = 25              # تعداد تست همزمان
-    test_timeout: int = 8                   # ثانیه
-    keep_top_n: int = 20
-    history_ttl_hours: int = 24
-    speed_test_enabled: bool = True         # تست سرعت دانلود (رد سرورهای خیلی کند)
-    min_speed_kbps: int = 50                # حداقل سرعت قبول (کیلوبیت بر ثانیه)
+    scanner_phone: Optional[str] = None     # شماره اکانت اسکنر
 
     # Paths
     db_path: Path = DATA_DIR / "bot.db"
-    geoip_path: Path = DATA_DIR / "GeoLite2-Country.mmdb"
 
     def is_owner(self, user_id: int) -> bool:
         return self.owner_id is not None and user_id == self.owner_id
