@@ -162,6 +162,10 @@ class ChannelScanner:
 
             entity = await self._resolve_entity(peer)
             channel_id = str(entity.id)
+            chan_title = getattr(entity, "title", "") or ""
+            chan_uname = getattr(entity, "username", "")
+            chan_ref = f"@{chan_uname}" if chan_uname else str(entity.id)
+            chan_display = f"{chan_title} ({chan_ref})" if chan_title else chan_ref
 
             # ---- بررسی دسترسی: تعداد کل پیام‌های قابل‌دسترس ----
             total = 0
@@ -249,7 +253,7 @@ class ChannelScanner:
             # خلاصه انواع پیام‌ها (برای دیباگ)
             breakdown = " | ".join(f"{k}: {v}" for k, v in stats.items() if v > 0)
             msg = (
-                f"✅ اسکن تموم شد\n"
+                f"✅ اسکن تموم شد — 📡 `{chan_display}`\n"
                 f"• کل پیام‌های کانال: {total if total > 0 else 'نامشخص'}\n"
                 f"• پیام‌های بررسی‌شده: {count}\n"
                 f"• ویدیو پیدا شد: {stats['video']}\n"
@@ -386,6 +390,38 @@ class ChannelScanner:
         # مرتب‌سازی گروه‌ها بر اساس تعداد تکراری (بیشترین اول)
         groups.sort(key=lambda g: len(g["dups"]), reverse=True)
         return groups
+
+    # ---------- لینک و پیش‌نمایش ----------
+    @staticmethod
+    def msg_link(channel, msg_id: int) -> str:
+        """لینک مستقیم به پیام (کاربر با کلیک می‌بینه)"""
+        try:
+            username = getattr(channel, "username", None)
+            if username:
+                return f"https://t.me/{username}/{msg_id}"
+            cid = str(getattr(channel, "id", ""))
+            if cid.startswith("-100"):
+                cid = cid[4:]
+            elif cid.startswith("-"):
+                cid = cid[1:]
+            return f"https://t.me/c/{cid}/{msg_id}"
+        except Exception:
+            return ""
+
+    async def forward_preview(self, channel_id, msg_ids: list[int], to_chat_id: int) -> tuple[bool, str]:
+        """فوروارد کردن خود پیام‌ها (ویدیو/فایل) به چت مدیر برای بررسی دستی"""
+        try:
+            await self.ensure_connected()
+            if not await self._client.is_user_authorized():
+                return False, "❌ وارد نشده‌ای"
+            entity = await self._client.get_entity(int(channel_id))
+            if not msg_ids:
+                return False, "چیزی برای فوروارد نیست"
+            await self._client.forward_messages(to_chat_id, msg_ids, entity)
+            return True, f"📤 {len(msg_ids)} پیام فوروارد شد — خودت چک کن."
+        except Exception as e:
+            logger.exception("forward_preview failed")
+            return False, f"❌ خطا در فوروارد: {str(e)[:120]}"
 
     # ---------- حذف ----------
     async def delete_duplicates(

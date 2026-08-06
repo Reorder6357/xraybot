@@ -796,6 +796,64 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("scan_view_") or data.startswith("scan_link_"):
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        channel_id = context.user_data.get("scan_groups_channel", "")
+        groups = context.user_data.get("scan_groups") or []
+        if not channel_id or not groups:
+            await query.answer("اول اسکن کن", show_alert=True)
+            return
+
+        # مشخص کردن گروه‌های هدف
+        sel = data.split("_")[2]
+        if sel == "all":
+            target_groups = groups
+        else:
+            try:
+                idx = int(sel)
+            except ValueError:
+                await query.answer("نامعتبر", show_alert=True)
+                return
+            if idx < 0 or idx >= len(groups):
+                await query.answer("نامعتبر", show_alert=True)
+                return
+            target_groups = [groups[idx]]
+
+        if data.startswith("scan_view_"):
+            # فوروارد خود پیام‌ها به چت مدیر
+            all_ids = []
+            for g in target_groups:
+                for it in g["items"]:
+                    all_ids.append(int(it["msg_id"]))
+            await query.edit_message_text(f"📤 در حال فوروارد {len(all_ids)} پیام برای بررسی...")
+            ok, msg = await scanner.forward_preview(channel_id, all_ids, query.message.chat.id)
+            await query.message.reply_text(msg, reply_markup=scanner_menu(True))
+        else:
+            # ارسال لینک‌ها
+            lines = []
+            for gi, g in enumerate(target_groups, 1):
+                lines.append(f"📦 گروه {gi}:")
+                for it in g["items"]:
+                    try:
+                        entity = await scanner._client.get_entity(int(channel_id))
+                        link = scanner.msg_link(entity, int(it["msg_id"]))
+                    except Exception:
+                        link = ""
+                    size_mb = it["size"] / (1024 * 1024)
+                    lines.append(f"  • {link} ({size_mb:.0f}MB)")
+            await query.message.reply_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=scanner_menu(True),
+            )
+            try:
+                await query.edit_message_text("📎 لینک‌ها فرستاده شد.")
+            except Exception:
+                pass
+        return
+
     if data == "scan_confirm_delete":
         if not settings.is_admin(user_id):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
@@ -1599,26 +1657,46 @@ async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     total_dups = sum(len(g["dups"]) for g in groups)
+
+    # ذخیره گروه‌ها برای دکمه‌های فوروارد/لینک
+    context.user_data["scan_groups_channel"] = channel_id
+    context.user_data["scan_groups"] = groups
+
     lines = [f"{msg}", "", f"📦 {len(groups)} گروه تکراری پیدا شد (مجموعاً {total_dups} نسخه اضافه):", ""]
-    for i, g in enumerate(groups[:10], 1):
-        it = g["items"][0]
-        name = it["filename"] or "بدون اسم"
-        size_mb = it["size"] / (1024 * 1024)
-        dur = it["duration"] or 0
+    for i, g in enumerate(groups[:8], 1):
+        keep = g["keep"]
+        name = keep["filename"] or "🎬 ویدیو بدون اسم"
+        size_mb = keep["size"] / (1024 * 1024)
+        dur = keep["duration"] or 0
         dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur > 0 else ""
         extra = f" ({size_mb:.0f}MB" + (f" — {dur_str})" if dur_str else ")")
-        lines.append(f"{i}. 🎬 `{name}`{extra} × {len(g['items'])} نسخه")
-    if len(groups) > 10:
-        lines.append(f"… و {len(groups) - 10} گروه دیگر")
+        lines.append(f"{i}. {name}{extra} × {len(g['items'])} نسخه")
+    if len(groups) > 8:
+        lines.append(f"… و {len(groups) - 8} گروه دیگر")
 
     lines.append("")
-    lines.append("از هر گروه فقط قدیمی‌ترین نسخه می‌مونه. حذف انجام بدم؟")
+    lines.append("برای هر گروه می‌تونی خود نسخه‌ها رو ببینی (دکمه‌های پایین) و بعد تصمیم بگیری.")
 
-    context.user_data["scan_groups_channel"] = channel_id
+    # دکمه‌ها: فوروارد/لینک برای گروه‌های اول + تأیید حذف
+    kb_rows = []
+    for i in range(min(len(groups), 5)):
+        kb_rows.append([
+            InlineKeyboardButton(f"👁 گروه {i+1} (نسخه‌ها)", callback_data=f"scan_view_{i}"),
+            InlineKeyboardButton(f"📎 لینک {i+1}", callback_data=f"scan_link_{i}"),
+        ])
+    if len(groups) > 5:
+        kb_rows.append([InlineKeyboardButton("👁 همه گروه‌ها", callback_data="scan_view_all")])
+        kb_rows.append([InlineKeyboardButton("📎 همه لینک‌ها", callback_data="scan_link_all")])
+    kb_rows.append([
+        InlineKeyboardButton("✅ حذف تکراری‌ها", callback_data="scan_confirm_delete"),
+        InlineKeyboardButton("❌ انصراف", callback_data="scan_cancel_delete"),
+    ])
+    kb = InlineKeyboardMarkup(kb_rows)
+
     await status.edit_text(
         "\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=confirm_keyboard("scan_confirm_delete", "scan_cancel_delete"),
+        reply_markup=kb,
     )
     return ConversationHandler.END
 
