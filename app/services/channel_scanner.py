@@ -120,7 +120,7 @@ class ChannelScanner:
             if not await self._client.is_user_authorized():
                 return False, "❌ اول باید با شماره وارد بشی (دکمه ورود)", 0
 
-            entity = await self._client.get_entity(peer)
+            entity = await self._resolve_entity(peer)
             channel_id = str(entity.id)
 
             files: list[dict] = []
@@ -159,6 +159,35 @@ class ChannelScanner:
         except Exception as e:
             logger.exception("scan_channel failed")
             return False, f"❌ خطا در اسکن: {str(e)[:150]}", 0
+
+    async def _resolve_entity(self, peer: str):
+        """پیدا کردن کانال با انعطاف: آیدی عددی، یوزرنیم، یا لینک t.me"""
+        entity = None
+        try:
+            entity = await self._client.get_entity(peer)
+        except Exception:
+            # تبدیل لینک به یوزرنیم
+            clean = peer.strip()
+            if clean.startswith("https://t.me/"):
+                clean = clean.replace("https://t.me/", "").split("/")[0]
+            if not clean.startswith("@") and not clean.startswith("-"):
+                clean = "@" + clean
+            try:
+                entity = await self._client.get_entity(clean)
+            except Exception:
+                # آخرین راه: resolve username
+                from telethon.tl.functions.contacts import ResolveUsernameRequest
+                clean2 = clean.lstrip("@")
+                try:
+                    res = await self._client(ResolveUsernameRequest(clean2))
+                    entity = res.chats[0] if res.chats else None
+                except Exception:
+                    entity = None
+        if entity is None:
+            raise RuntimeError(
+                "کانال پیدا نشد. مطمئن شو اکانت اسکنر توی اون کانال عضوه یا یه پیام ازش فوروارد کن."
+            )
+        return entity
 
     # ---------- تشخیص تکراری ----------
     @staticmethod

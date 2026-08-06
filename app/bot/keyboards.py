@@ -62,15 +62,18 @@ def personal_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def extract_actions_keyboard() -> InlineKeyboardMarkup:
+def extract_actions_keyboard(scan: bool = False) -> InlineKeyboardMarkup:
     """دکمه‌های زیر پیام استخراج کانفیگ"""
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("⚡ تست همین الان", callback_data="act_test_now")],
         [
             InlineKeyboardButton("👤 ذخیره در شخصی", callback_data="act_save_personal"),
             InlineKeyboardButton("🗑 حذف از صف", callback_data="act_remove_queue"),
         ],
-    ])
+    ]
+    if scan:
+        rows.insert(0, [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")])
+    return InlineKeyboardMarkup(rows)
 
 
 def cancel_run_keyboard() -> InlineKeyboardMarkup:

@@ -669,6 +669,25 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "act_scan_forward":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        peer = context.user_data.get("last_forward_peer", "")
+        if not peer:
+            await query.answer("اول یه پیام از کانال فوروارد کن", show_alert=True)
+            return
+        await query.edit_message_text(f"⏳ در حال اسکن کانال «{peer}»...")
+        status = query.message
+        async def progress(count):
+            try:
+                await status.edit_text(f"⏳ در حال اسکن... {count} پیام بررسی شد")
+            except Exception:
+                pass
+        ok, msg, nfiles = await scanner.scan_channel(peer, progress_cb=progress)
+        await query.edit_message_text(msg, reply_markup=scanner_menu(await scanner.is_logged_in()))
+        return
+
     if data == "act_cancel_run":
         ev = context.bot_data.get("cancel_event")
         if ev:
@@ -698,8 +717,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "scan_login":
-        if not is_owner:
-            await query.answer("⛔ فقط مدیر اصلی", show_alert=True)
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
         # چک api_id/api_hash
         if not settings.tg_api_id or not settings.tg_api_hash:
@@ -736,8 +755,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "scan_confirm_delete":
-        if not is_owner:
-            await query.answer("⛔ فقط مدیر اصلی", show_alert=True)
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
         channel_id = context.user_data.get("scan_groups_channel", "")
         if not channel_id:
@@ -1045,6 +1064,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # لینک‌ها رو برای دکمه‌های اکشن نگه می‌داریم
     context.user_data["last_extracted_links"] = links
 
+    # اگه فوروارد از یه کانال باشه و اسکنر لاگین باشه، دکمه اسکن اون کانال رو هم نشون بده
+    scan_extra = ""
+    if source == "forward" and source_detail:
+        try:
+            if await scanner.is_logged_in():
+                context.user_data["last_forward_peer"] = source_detail
+                scan_extra = "\n\n📡 این پیام از کانال «" + source_detail + "» فوروارد شده.\nمی‌خوای کل کانال رو اسکن کنم؟"
+        except Exception:
+            pass
+
     skipped = _count_non_testable(text)
     lines = [
         f"✅ استخراج انجام شد",
@@ -1161,13 +1190,16 @@ async def handle_media_caption(update: Update, context: ContextTypes.DEFAULT_TYP
             addr = info.get("address") or "?"
             lines.append(f"• `{_esc(proto)}` → `{_esc(addr)}`")
 
+    if scan_extra:
+        lines.append(scan_extra)
     lines.append("\n🎛 با دکمه‌های زیر انتخاب کن:")
 
     text_out = "\n".join(lines)
+    kb = extract_actions_keyboard(scan=bool(scan_extra))
     try:
-        await message.reply_text(text_out, parse_mode="Markdown", reply_markup=extract_actions_keyboard())
+        await message.reply_text(text_out, parse_mode="Markdown", reply_markup=kb)
     except Exception:
-        await message.reply_text(text_out, reply_markup=extract_actions_keyboard())
+        await message.reply_text(text_out, reply_markup=kb)
     await _ensure_fixed_keyboard(update, context)
 
 
@@ -1420,7 +1452,7 @@ async def cmd_personal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Scanner conversation handlers --------------------
 
-@owner_only
+@admin_only
 async def received_scan_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     if not text.isdigit():
@@ -1434,7 +1466,7 @@ async def received_scan_api_id(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAIT_SCAN_API_HASH
 
 
-@owner_only
+@admin_only
 async def received_scan_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_hash = update.effective_message.text.strip()
     api_id = context.user_data.get("scan_api_id")
@@ -1454,7 +1486,7 @@ async def received_scan_api_hash(update: Update, context: ContextTypes.DEFAULT_T
     return WAIT_SCAN_PHONE
 
 
-@owner_only
+@admin_only
 async def received_scan_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.effective_message.text.strip()
     if not phone.startswith("+"):
@@ -1471,7 +1503,7 @@ async def received_scan_phone(update: Update, context: ContextTypes.DEFAULT_TYPE
     return WAIT_SCAN_PHONE
 
 
-@owner_only
+@admin_only
 async def received_scan_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.effective_message.text.strip()
     phone = context.user_data.get("scan_phone", "")
@@ -1484,7 +1516,7 @@ async def received_scan_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END if ok else WAIT_SCAN_CODE
 
 
-@owner_only
+@admin_only
 async def received_scan_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pw = update.effective_message.text.strip()
     ok, msg = await scanner.submit_password(pw)
@@ -1492,7 +1524,7 @@ async def received_scan_password(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END if ok else WAIT_SCAN_PASSWORD
 
 
-@owner_only
+@admin_only
 async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     peer = update.effective_message.text.strip()
     status = await update.effective_message.reply_text("⏳ در حال اسکن کانال... (ممکنه چند دقیقه طول بکشه)")
