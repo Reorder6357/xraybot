@@ -263,6 +263,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAIT_SCAN_PHONE
 
+    if data == "act_scan_forward":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        peer = context.user_data.get("last_forward_peer", "")
+        hints = context.user_data.get("last_forward_hints") or {}
+        if not peer:
+            await query.answer("اول یه پیام از کانال فوروارد کن", show_alert=True)
+            return
+        # تبدیل callback به یک پیام جدید تا reply_text کار کنه
+        await query.edit_message_text(f"⏳ شروع اسکن کانال «{hints.get('title') or peer}»...")
+        await _start_scan_for_peer(update, context, peer, hints)
+        return
+
     if data == "scan_channel":
         await query.edit_message_text(
             "📡 آیدی عددی کانال یا یوزرنیمش رو بفرست:\n"
@@ -630,9 +644,9 @@ async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TY
         await status.edit_text(msg, reply_markup=scanner_menu(await scanner.is_logged_in()))
         return ConversationHandler.END
 
-    # تشخیص تکراری
+    # تشخیص تکراری (با resolve مطمئن)
     try:
-        entity = await scanner._client.get_entity(peer)
+        entity = await scanner._resolve_entity(peer, None)
         channel_id = str(entity.id)
         found = await scanner.find_duplicates(channel_id)
     except Exception as e:
@@ -737,6 +751,62 @@ async def do_scan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 
 # -------------------- فوروارد → اسکن --------------------
 
+async def _start_scan_for_peer(update: Update, context: ContextTypes.DEFAULT_TYPE, peer: str, hints: dict = None):
+    """شروع اسکن کانال با پیام پیشرفت + گزارش تکراری‌ها (با قفل ضد اجرای همزمان)"""
+    hints = hints or {}
+    # قفل: اگه همین الان اسکنی در حال اجراست، شروع نکن
+    if context.bot_data.get("scan_running"):
+        await update.effective_message.reply_text(
+            "⏳ الان یه اسکن دیگه در حال اجراست — کمی صبر کن و دوباره فوروارد کن.",
+            reply_markup=back_only(),
+        )
+        return
+
+    # چک لاگین
+    if not await scanner.is_logged_in():
+        await update.effective_message.reply_text(
+            "⚠️ اول باید توی بخش «📡 اسکن کانال» با اکانت اسکنر لاگین کنی.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 ورود اسکنر", callback_data="scan_login")],
+            ]),
+        )
+        return
+
+    title = hints.get("title") or peer
+    status = await update.effective_message.reply_text(
+        f"⏳ در حال اسکن کانال «{_esc(title)}»...\n(ممکنه چند دقیقه طول بکشه)",
+        parse_mode="Markdown",
+    )
+
+    context.bot_data["scan_running"] = True
+    try:
+        async def progress(count):
+            try:
+                await status.edit_text(f"⏳ در حال اسکن... {count} پیام بررسی شد")
+            except Exception:
+                pass
+
+        ok, msg, nfiles = await scanner.scan_channel(peer, progress_cb=progress, hints=hints)
+        if not ok:
+            await status.edit_text(msg, reply_markup=scanner_menu(True))
+            return
+
+        # تشخیص تکراری (با resolve مطمئن مثل خود اسکن)
+        try:
+            entity = await scanner._resolve_entity(peer, hints)
+            channel_id = str(entity.id)
+            found = await scanner.find_duplicates(channel_id)
+        except Exception as e:
+            await status.edit_text(f"{msg}\n\n❌ خطا در تشخیص تکراری: {str(e)[:100]}", reply_markup=back_only())
+            return
+
+        await show_duplicate_report(update, context, status, msg, channel_id, found)
+    finally:
+        context.bot_data["scan_running"] = False
+
+
+# -------------------- فوروارد → اسکن --------------------
+
 @admin_only
 async def handle_forward_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """فوروارد ویدیو/عکس/صدا بدون کپشن — دکمه اسکن کانال مبدأ"""
@@ -755,27 +825,9 @@ async def handle_forward_media(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data["last_forward_peer"] = source
     context.user_data["last_forward_hints"] = _forward_hints(message)
-    logged = await scanner.is_logged_in()
 
-    text = (
-        f"📡 این پیام از کانال «{_esc(source)}» فوروارد شده.\n"
-        f"می‌خوای کل کانال رو اسکن کنم و تکراری‌ها رو پیدا کنم؟"
-    )
-    if not logged:
-        text += "\n\n⚠️ اول باید توی بخش «📡 اسکن کانال» با اکانت اسکنر لاگین کنی."
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")],
-            [InlineKeyboardButton("🔑 ورود اسکنر", callback_data="scan_login")],
-        ])
-    else:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")],
-        ])
-
-    try:
-        await message.reply_text(text, reply_markup=kb)
-    except Exception:
-        await message.reply_text(text, reply_markup=kb)
+    # 🤖 خودکار: مستقیم اسکن شروع می‌شه (اگه لاگین باشه)
+    await _start_scan_for_peer(update, context, source, context.user_data.get("last_forward_hints"))
 
 
 @admin_only
@@ -789,25 +841,9 @@ async def handle_forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     context.user_data["last_forward_peer"] = source
     context.user_data["last_forward_hints"] = _forward_hints(message)
-    logged = await scanner.is_logged_in()
-    text = (
-        f"📡 این پیام از کانال «{_esc(source)}» فوروارد شده.\n"
-        f"می‌خوای کل کانال رو اسکن کنم و تکراری‌ها رو پیدا کنم؟"
-    )
-    if not logged:
-        text += "\n\n⚠️ اول باید توی بخش «📡 اسکن کانال» با اکانت اسکنر لاگین کنی."
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")],
-            [InlineKeyboardButton("🔑 ورود اسکنر", callback_data="scan_login")],
-        ])
-    else:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")],
-        ])
-    try:
-        await message.reply_text(text, reply_markup=kb)
-    except Exception:
-        await message.reply_text(text, reply_markup=kb)
+
+    # 🤖 خودکار: مستقیم اسکن شروع می‌شه (اگه لاگین باشه)
+    await _start_scan_for_peer(update, context, source, context.user_data.get("last_forward_hints"))
 
 
 # -------------------- آپدیت ZIP --------------------
