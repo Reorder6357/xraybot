@@ -63,9 +63,18 @@ def _forward_source_detail(message) -> str:
         return ""
     try:
         if origin.type == "channel":
-            return origin.chat.title or str(origin.chat.id)
+            # اول یوزرنیم (قابل resolve)، بعد آیدی عددی، بعد اسم (برای نمایش)
+            if origin.chat.username:
+                return "@" + origin.chat.username
+            if origin.chat.id:
+                return str(origin.chat.id)
+            return origin.chat.title or ""
         if origin.type == "chat":
-            return origin.sender_chat.title or str(origin.sender_chat.id)
+            if origin.sender_chat.username:
+                return "@" + origin.sender_chat.username
+            if origin.sender_chat.id:
+                return str(origin.sender_chat.id)
+            return origin.sender_chat.title or "" 
         if origin.type == "user":
             return origin.sender_user.full_name or str(origin.sender_user.id)
         if origin.type == "hidden_user":
