@@ -728,7 +728,7 @@ class ChannelScanner:
             from telethon.tl.functions.channels import (
                 GetParticipantRequest, EditAdminRequest,
             )
-            from telethon.tl.types import ChannelAdminRights, InputUser
+            from telethon.tl.types import ChatAdminRights, InputUser
 
             # دسترسی‌های فعلی ادمین اسکنر
             try:
@@ -744,7 +744,7 @@ class ChannelScanner:
                 await self._client(EditAdminRequest(
                     channel=entity,
                     user_id=InputUser(me.id, me.access_hash),
-                    admin_rights=ChannelAdminRights(),
+                    admin_rights=ChatAdminRights(),
                     rank="",
                 ))
             except Exception as e:
