@@ -826,19 +826,13 @@ class ChannelScanner:
             todo = [m for m in deleted_msgs if m.id not in done_ids]
             skipped = len(done_ids)  # تعداد از قبل موفق
 
-            # فایل‌های نیمه‌دانلود: اگه فایل روی دیسک هست، دوباره دانلود نکن
+            # فایل‌های نیمه‌دانلود از اجرای قبلی: چون ممکنه ناقص باشن (قطعی وسط دانلود)،
+            # پاکشون می‌کنیم تا از نو دانلود بشن — ویدیوی خراب آپلود نشه
             for m in todo:
                 existing = tmp_dir / f"recover_{m.id}"
-                if existing.exists() and existing.stat().st_size > 0:
-                    # فایل هست — فقط آپلودش کن
+                if existing.exists():
                     try:
-                        await self._client.send_file(entity, str(existing), caption=m.message or "")
-                        done_ids.add(m.id)
-                        try:
-                            existing.unlink()
-                        except Exception:
-                            pass
-                        continue
+                        existing.unlink()
                     except Exception:
                         pass
 
@@ -879,6 +873,16 @@ class ChannelScanner:
                     await db.save_recover_state(channel_id, done_ids, fail_ids)
                 except Exception:
                     pass
+
+            # پاکسازی نهایی: هر فایل باقی‌مانده در tmp (ناقص یا قدیمی) رو حذف کن
+            try:
+                for leftover in tmp_dir.glob("recover_*"):
+                    try:
+                        leftover.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             state = await db.get_recover_state(channel_id)
             resume_note = ""
