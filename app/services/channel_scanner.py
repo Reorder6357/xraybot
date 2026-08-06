@@ -253,6 +253,8 @@ class ChannelScanner:
 
             # خلاصه انواع پیام‌ها (برای دیباگ)
             breakdown = " | ".join(f"{k}: {v}" for k, v in stats.items() if v > 0)
+            with_name = sum(1 for f in files if f.get("filename"))
+            with_dur = sum(1 for f in files if (f.get("duration") or 0) > 0)
             msg = (
                 f"✅ اسکن تموم شد — 📡 `{chan_display}`\n"
                 f"• کل پیام‌های کانال: {total if total > 0 else 'نامشخص'}\n"
@@ -261,7 +263,8 @@ class ChannelScanner:
                 f"• فایل پیدا شد: {stats['doc']}\n"
                 f"• عکس: {stats['photo']} | گیف: {stats['gif']}\n"
                 f"• متن: {stats['text']} | سایر: {stats['other']}\n"
-                f"• مجموع مدیا: {len(files)}"
+                f"• مجموع مدیا: {len(files)}\n"
+                f"• فایل با اسم: {with_name} | با مدت: {with_dur}"
                 + warn
             )
             logger.info(f"Scan finished: total={total} checked={count} files={len(files)} breakdown={breakdown}")
@@ -367,19 +370,21 @@ class ChannelScanner:
         name = re.sub(r"[\W_]+", "", name)
         return name
 
-    async def find_duplicates(self, channel_id: str) -> list[dict]:
+    async def find_duplicates(self, channel_id: str) -> dict:
         """
-        گروه‌های تکراری:
-         - کلید ۱: اسم فایل نرمال‌شده یکسان
-         - کلید ۲: حجم یکسان + مدت یکسان (برای فایل‌های تغییرنام‌داده)
-        برمی‌گردونه: لیست گروه‌ها (هر گروه: {key, items})
+        تشخیص تکراری در دو سطح:
+         - sure:    اسم نرمال‌شده یکسان، یا (حجم + مدت) یکسان → تقریباً قطعی
+         - suspect: فقط حجم یکسان (بدون اسم/مدت یکسان) → باید خودت چک کنی
+        برمی‌گردونه: {"sure": [گروه‌ها], "suspect": [گروه‌ها]}
         """
         rows = await db.get_scanned_files(channel_id)
+        sure_groups: list[dict] = []
+        suspect_groups: list[dict] = []
         if len(rows) < 2:
-            return []
+            return {"sure": sure_groups, "suspect": suspect_groups}
 
-        # union-find ساده برای ادغام
-        parent = list(range(len(rows)))
+        n = len(rows)
+        parent = list(range(n))
 
         def find(i):
             while parent[i] != i:
@@ -392,7 +397,7 @@ class ChannelScanner:
             if ra != rb:
                 parent[rb] = ra
 
-        # کلید ۱: اسم
+        # کلید ۱ (قطعی): اسم نرمال‌شده یکسان
         by_name: dict[str, list[int]] = {}
         for i, r in enumerate(rows):
             key = self._norm_filename(r["filename"] or "")
@@ -400,11 +405,10 @@ class ChannelScanner:
                 by_name.setdefault(key, []).append(i)
         for key, idxs in by_name.items():
             if len(idxs) > 1:
-                first = idxs[0]
                 for j in idxs[1:]:
-                    union(first, j)
+                    union(idxs[0], j)
 
-        # کلید ۲: حجم + مدت
+        # کلید ۲ (قطعی): حجم + مدت یکسان (هر دو > 0)
         by_sd: dict[tuple, list[int]] = {}
         for i, r in enumerate(rows):
             size = int(r["size"] or 0)
@@ -413,38 +417,57 @@ class ChannelScanner:
                 by_sd.setdefault((size, int(dur)), []).append(i)
         for key, idxs in by_sd.items():
             if len(idxs) > 1:
-                first = idxs[0]
                 for j in idxs[1:]:
-                    union(first, j)
+                    union(idxs[0], j)
 
-        # ساخت گروه‌ها
+        # ساخت گروه‌ها و تشخیص سطح
         groups_map: dict[int, list] = {}
         for i, r in enumerate(rows):
             groups_map.setdefault(find(i), []).append(r)
 
-        groups = []
+        # فایل‌هایی که توی هیچ گروه قطعی نیفتادن
+        in_sure = set()
         for root, items in groups_map.items():
             if len(items) < 2:
                 continue
-            # فقط گروه‌هایی که واقعاً دلیل تکرار دارن:
-            # یا اسم یکسان دارن، یا (حجم+مدت) یکسان
+            items_sorted = sorted(items, key=lambda it: (it["date"] or 0, it["msg_id"]))
             names = {self._norm_filename(it["filename"] or "") for it in items}
             names.discard("")
             sds = {(int(it["size"] or 0), int(float(it["duration"] or 0))) for it in items}
             sds.discard((0, 0))
-            has_reason = len(names) < len(items) or len(sds) < len(items)
-            if not has_reason:
+            same_name = len(names) < len(items)
+            same_sd = len(sds) < len(items)
+            if same_name or same_sd:
+                group = {
+                    "items": items_sorted,
+                    "keep": items_sorted[0],
+                    "dups": items_sorted[1:],
+                }
+                sure_groups.append(group)
+                for it in items:
+                    in_sure.add(it["msg_id"])
+
+        # سطح مشکوک: فقط هم‌حجم (duration ثبت نشده) — جدا از گروه‌های قطعی
+        remaining = [r for r in rows if r["msg_id"] not in in_sure]
+        by_size: dict[int, list] = {}
+        for r in remaining:
+            size = int(r["size"] or 0)
+            if size > 0:
+                by_size.setdefault(size, []).append(r)
+        for size, items in by_size.items():
+            if len(items) < 2:
                 continue
+            # اگه اسم‌ها هم یکسان بودن، قطعی بود؛ پس اینجا حتماً متفاوتن → مشکوک
             items_sorted = sorted(items, key=lambda it: (it["date"] or 0, it["msg_id"]))
-            groups.append({
+            suspect_groups.append({
                 "items": items_sorted,
-                "keep": items_sorted[0],  # قدیمی‌ترین می‌مونه
+                "keep": items_sorted[0],
                 "dups": items_sorted[1:],
             })
 
-        # مرتب‌سازی گروه‌ها بر اساس تعداد تکراری (بیشترین اول)
-        groups.sort(key=lambda g: len(g["dups"]), reverse=True)
-        return groups
+        sure_groups.sort(key=lambda g: len(g["dups"]), reverse=True)
+        suspect_groups.sort(key=lambda g: len(g["dups"]), reverse=True)
+        return {"sure": sure_groups, "suspect": suspect_groups}
 
     # ---------- لینک و پیش‌نمایش ----------
     @staticmethod

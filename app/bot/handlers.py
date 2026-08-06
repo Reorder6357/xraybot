@@ -802,28 +802,34 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
         channel_id = context.user_data.get("scan_groups_channel", "")
-        groups = context.user_data.get("scan_groups") or []
-        if not channel_id or not groups:
+        stored = context.user_data.get("scan_groups") or {}
+        sure_groups = stored.get("sure") or []
+        suspect_groups = stored.get("suspect") or []
+        if not channel_id or (not sure_groups and not suspect_groups):
             await query.answer("اول اسکن کن", show_alert=True)
             return
 
-        # مشخص کردن گروه‌های هدف
-        sel = data.split("_")[2]
+        # پارس کردن: scan_view_sure_0 / scan_view_suspect_all / scan_link_sure_1
+        parts = data.split("_")  # ["scan", "view"/"link", "sure"/"suspect", "0"/"all"]
+        is_view = parts[1] == "view"
+        level = parts[2]  # sure | suspect
+        sel = parts[3]
+        pool = sure_groups if level == "sure" else suspect_groups
+
         if sel == "all":
-            target_groups = groups
+            target_groups = pool
         else:
             try:
                 idx = int(sel)
             except ValueError:
                 await query.answer("نامعتبر", show_alert=True)
                 return
-            if idx < 0 or idx >= len(groups):
+            if idx < 0 or idx >= len(pool):
                 await query.answer("نامعتبر", show_alert=True)
                 return
-            target_groups = [groups[idx]]
+            target_groups = [pool[idx]]
 
-        if data.startswith("scan_view_"):
-            # فوروارد خود پیام‌ها به چت مدیر
+        if is_view:
             all_ids = []
             for g in target_groups:
                 for it in g["items"]:
@@ -832,7 +838,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok, msg = await scanner.forward_preview(channel_id, all_ids, query.message.chat.id)
             await query.message.reply_text(msg, reply_markup=scanner_menu(True))
         else:
-            # ارسال لینک‌ها
             lines = []
             for gi, g in enumerate(target_groups, 1):
                 lines.append(f"📦 گروه {gi}:")
@@ -863,7 +868,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not channel_id:
             await query.answer("اول اسکن کن", show_alert=True)
             return
-        await do_scan_delete(update, context, channel_id)
+        await do_scan_delete(update, context, channel_id, only_sure=True)
+        return
+
+    if data == "scan_confirm_delete_suspect":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        channel_id = context.user_data.get("scan_groups_channel", "")
+        if not channel_id:
+            await query.answer("اول اسکن کن", show_alert=True)
+            return
+        await do_scan_delete(update, context, channel_id, only_sure=False)
         return
 
     if data == "scan_cancel_delete":
@@ -1685,14 +1701,93 @@ async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TY
         await status.edit_text(msg, reply_markup=scanner_menu(await scanner.is_logged_in()))
         return ConversationHandler.END
 
-    # تشخیص تکراری
+    # تشخیص تکراری (دو سطح: قطعی + مشکوک)
     try:
         entity = await scanner._client.get_entity(peer)
         channel_id = str(entity.id)
-        groups = await scanner.find_duplicates(channel_id)
+        found = await scanner.find_duplicates(channel_id)
     except Exception as e:
         await status.edit_text(f"{msg}\n\n❌ خطا در تشخیص تکراری: {str(e)[:100]}", reply_markup=back_only())
         return ConversationHandler.END
+
+    sure_groups = found.get("sure") or []
+    suspect_groups = found.get("suspect") or []
+
+    if not sure_groups and not suspect_groups:
+        await status.edit_text(
+            f"{msg}\n\n🎉 هیچ فایل تکراری پیدا نشد!",
+            reply_markup=scanner_menu(True),
+        )
+        return ConversationHandler.END
+
+    # ذخیره برای دکمه‌ها
+    context.user_data["scan_groups_channel"] = channel_id
+    context.user_data["scan_groups"] = {"sure": sure_groups, "suspect": suspect_groups}
+
+    lines = [f"{msg}", ""]
+
+    # بخش قطعی
+    if sure_groups:
+        total_dups = sum(len(g["dups"]) for g in sure_groups)
+        lines.append(f"✅ {len(sure_groups)} گروه تکراری قطعی (مجموعاً {total_dups} نسخه اضافه):")
+        lines.append("")
+        for i, g in enumerate(sure_groups[:8], 1):
+            keep = g["keep"]
+            name = keep["filename"] or "🎬 بدون اسم"
+            size_mb = keep["size"] / (1024 * 1024)
+            dur = keep["duration"] or 0
+            dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur > 0 else ""
+            extra = f" ({size_mb:.0f}MB" + (f" — {dur_str})" if dur_str else ")")
+            lines.append(f"{i}. {name}{extra} × {len(g['items'])} نسخه")
+        if len(sure_groups) > 8:
+            lines.append(f"… و {len(sure_groups) - 8} گروه دیگر")
+        lines.append("")
+
+    # بخش مشکوک (فقط هم‌حجم)
+    if suspect_groups:
+        total_dups_s = sum(len(g["dups"]) for g in suspect_groups)
+        lines.append(f"⚠️ {len(suspect_groups)} گروه مشکوک (فقط هم‌حجم — ممکنه اشتباه باشه، خودت چک کن):")
+        lines.append("")
+        for i, g in enumerate(suspect_groups[:5], 1):
+            keep = g["keep"]
+            name = keep["filename"] or "🎬 بدون اسم"
+            size_mb = keep["size"] / (1024 * 1024)
+            lines.append(f"⚠️ {i}. {name} ({size_mb:.0f}MB) × {len(g['items'])} نسخه")
+        if len(suspect_groups) > 5:
+            lines.append(f"… و {len(suspect_groups) - 5} گروه مشکوک دیگر")
+        lines.append("")
+
+    lines.append("با دکمه‌های پایین، نسخه‌ها رو ببین و بعد تصمیم بگیر.")
+
+    # دکمه‌ها
+    kb_rows = []
+    if sure_groups:
+        for i in range(min(len(sure_groups), 5)):
+            kb_rows.append([
+                InlineKeyboardButton(f"👁 قطعی {i+1}", callback_data=f"scan_view_sure_{i}"),
+                InlineKeyboardButton(f"📎 {i+1}", callback_data=f"scan_link_sure_{i}"),
+            ])
+        if len(sure_groups) > 5:
+            kb_rows.append([InlineKeyboardButton("👁 همه قطعی‌ها", callback_data="scan_view_sure_all")])
+            kb_rows.append([InlineKeyboardButton("📎 همه لینک‌ها", callback_data="scan_link_sure_all")])
+        kb_rows.append([
+            InlineKeyboardButton("✅ حذف قطعی‌ها", callback_data="scan_confirm_delete"),
+        ])
+    if suspect_groups:
+        for i in range(min(len(suspect_groups), 4)):
+            kb_rows.append([
+                InlineKeyboardButton(f"👁 مشکوک {i+1}", callback_data=f"scan_view_suspect_{i}"),
+                InlineKeyboardButton(f"📎 {i+1}", callback_data=f"scan_link_suspect_{i}"),
+            ])
+        if len(suspect_groups) > 4:
+            kb_rows.append([InlineKeyboardButton("👁 همه مشکوک‌ها", callback_data="scan_view_suspect_all")])
+            kb_rows.append([InlineKeyboardButton("📎 همه لینک مشکوک‌ها", callback_data="scan_link_suspect_all")])
+        kb_rows.append([
+            InlineKeyboardButton("🗑 حذف مشکوک‌ها (با چک خودت)", callback_data="scan_confirm_delete_suspect"),
+        ])
+    kb_rows.append([InlineKeyboardButton("❌ انصراف", callback_data="scan_cancel_delete")])
+    kb = InlineKeyboardMarkup(kb_rows)
+
 
     if not groups:
         await status.edit_text(
@@ -1746,10 +1841,11 @@ async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-async def do_scan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str):
+async def do_scan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str, only_sure: bool = True):
     query = update.callback_query
     status = await query.edit_message_text("⏳ در حال حذف تکراری‌ها...")
-    groups = await scanner.find_duplicates(channel_id)
+    found = await scanner.find_duplicates(channel_id)
+    groups = (found.get("sure") or []) if only_sure else ((found.get("sure") or []) + (found.get("suspect") or []))
     if not groups:
         await status.edit_text("چیزی برای حذف نیست.", reply_markup=scanner_menu(True))
         return
