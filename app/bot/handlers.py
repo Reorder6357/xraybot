@@ -811,10 +811,14 @@ async def show_duplicate_report(update, context, status, msg, channel_id, found)
 
     if not sure_groups and not suspect_groups:
         debug = found.get("debug") or ""
-        await status.edit_text(
-            f"{msg}\n\n🎉 هیچ فایل تکراری پیدا نشد!{debug}",
-            reply_markup=scanner_menu(True),
-        )
+        text_out = f"{msg}\n\n🎉 هیچ فایل تکراری پیدا نشد!{_esc(debug)}"
+        try:
+            await status.edit_text(text_out, reply_markup=scanner_menu(True))
+        except Exception:
+            try:
+                await status.edit_text(text_out, reply_markup=scanner_menu(True))
+            except Exception:
+                pass
         return
 
     # ذخیره برای دکمه‌ها
@@ -829,7 +833,7 @@ async def show_duplicate_report(update, context, status, msg, channel_id, found)
         lines.append("")
         for i, g in enumerate(sure_groups[:8], 1):
             keep = g["keep"]
-            name = keep["filename"] or "🎬 بدون اسم"
+            name = _esc(keep["filename"] or "🎬 بدون اسم")
             size_mb = keep["size"] / (1024 * 1024)
             dur = keep["duration"] or 0
             dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur > 0 else ""
@@ -845,7 +849,7 @@ async def show_duplicate_report(update, context, status, msg, channel_id, found)
         lines.append("")
         for i, g in enumerate(suspect_groups[:5], 1):
             keep = g["keep"]
-            name = keep["filename"] or "🎬 بدون اسم"
+            name = _esc(keep["filename"] or "🎬 بدون اسم")
             size_mb = keep["size"] / (1024 * 1024)
             dur = keep["duration"] or 0
             dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur > 0 else ""
@@ -881,7 +885,15 @@ async def show_duplicate_report(update, context, status, msg, channel_id, found)
     kb_rows.append([InlineKeyboardButton("❌ انصراف", callback_data="scan_cancel_delete")])
     kb = InlineKeyboardMarkup(kb_rows)
 
-    await status.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+    text_out = "\n".join(lines)
+    try:
+        await status.edit_text(text_out, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        # اگه مارک‌داون خطا داد (اسم فایل عجیب)، بدون parse_mode بفرست که حتماً برسه
+        try:
+            await status.edit_text(text_out, reply_markup=kb)
+        except Exception:
+            pass
 
 
 async def do_scan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str, only_sure: bool = True):
