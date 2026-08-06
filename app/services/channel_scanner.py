@@ -730,9 +730,19 @@ class ChannelScanner:
             )
             from telethon.tl.types import ChatAdminRights
 
-            # 🔑 درست: get_input_entity خودش access_hash واقعی رو از کش می‌گیره
+            # 🔑 روش قطعی: InputUser رو مستقیم با user_id و access_hash از InputPeerUser بساز
             try:
-                me_input = await self._client.get_input_entity("me")
+                me_user = await self._client.get_me()
+                if me_user is None:
+                    return False, "❌ اکانت اسکنر پیدا نشد"
+                me_peer = await self._client.get_input_entity(me_user)  # InputPeerSelf یا InputPeerUser
+                from telethon.tl.types import InputPeerSelf, InputUser
+                if isinstance(me_peer, InputPeerSelf):
+                    # برای self، access_hash در دسترس نیست — از session بردار
+                    me_input = InputUser(me_user.id, 0)
+                else:
+                    me_input = InputUser(getattr(me_peer, "user_id", me_user.id),
+                                         getattr(me_peer, "access_hash", 0))
             except Exception as e:
                 return False, f"❌ اکانت اسکنر پیدا نشد: {str(e)[:80]}"
 
