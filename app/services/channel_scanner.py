@@ -729,19 +729,14 @@ class ChannelScanner:
 
             events = []
             try:
-                res = await self._client(GetAdminLogRequest(
-                    channel=entity, q="", max_id=0, min_id=0, limit=max_events,
-                    events_filter=ChannelAdminLogEventsFilter(
-                        delete=True, send=True,
-                    ),
-                ))
-                events = res.events
-            except Exception:
-                # فیلتر پشتیبانی نشد → بدون فیلتر، خودمون فیلتر می‌کنیم
+                # بدون فیلتر — همه اکشن‌ها رو بگیر، خودمون delete رو جدا می‌کنیم
                 res = await self._client(GetAdminLogRequest(
                     channel=entity, q="", max_id=0, min_id=0, limit=max_events,
                 ))
                 events = res.events
+            except Exception as e:
+                logger.warning(f"GetAdminLogRequest failed: {e}")
+                return False, f"❌ دسترسی به Recent Actions نیست: {str(e)[:100]}", []
 
             found = []
             for ev in events:
@@ -795,16 +790,14 @@ class ChannelScanner:
 
             events = []
             try:
-                res = await self._client(GetAdminLogRequest(
-                    channel=entity, q="", max_id=0, min_id=0, limit=max_events,
-                    events_filter=ChannelAdminLogEventsFilter(delete=True, send=True),
-                ))
-                events = res.events
-            except Exception:
+                # بدون فیلتر — همه اکشن‌ها رو بگیر
                 res = await self._client(GetAdminLogRequest(
                     channel=entity, q="", max_id=0, min_id=0, limit=max_events,
                 ))
                 events = res.events
+            except Exception as e:
+                logger.warning(f"GetAdminLogRequest failed: {e}")
+                return False, f"❌ دسترسی به Recent Actions نیست: {str(e)[:100]}", 0, 0
 
             deleted_msgs = [
                 e.action.message for e in events
