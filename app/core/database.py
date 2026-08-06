@@ -37,6 +37,14 @@ class Database:
                 added_at REAL
             );
 
+            -- پیشرفت بازیابی فیلم‌های پاک‌شده (برای ادامه از جایی که قطع شد)
+            CREATE TABLE IF NOT EXISTS recover_state (
+                channel_id TEXT PRIMARY KEY,
+                done_ids TEXT DEFAULT '[]',
+                fail_ids TEXT DEFAULT '[]',
+                updated_at REAL
+            );
+
             -- نتیجه آخرین اسکن هر کانال (تا دوباره اسکن نشه)
             CREATE TABLE IF NOT EXISTS scan_results (
                 channel_id TEXT PRIMARY KEY,
@@ -145,6 +153,41 @@ class Database:
         except Exception:
             result["groups"] = {}
         return result
+
+    # ---------- recover state (پیشرفت بازیابی) ----------
+    async def save_recover_state(self, channel_id: str, done_ids: set, fail_ids: set):
+        import json as _json
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO recover_state (channel_id, done_ids, fail_ids, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (channel_id, _json.dumps(list(done_ids)), _json.dumps(list(fail_ids)), time.time()),
+        )
+        await self._conn.commit()
+
+    async def get_recover_state(self, channel_id: str) -> Optional[dict]:
+        cur = await self._conn.execute(
+            "SELECT * FROM recover_state WHERE channel_id = ?", (channel_id,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        import json as _json
+        return {
+            "done_ids": _json.loads(row["done_ids"] or "[]"),
+            "fail_ids": _json.loads(row["fail_ids"] or "[]"),
+            "updated_at": row["updated_at"],
+        }
+
+    async def clear_recover_state(self, channel_id: str = ""):
+        if channel_id:
+            await self._conn.execute(
+                "DELETE FROM recover_state WHERE channel_id = ?", (channel_id,)
+            )
+        else:
+            await self._conn.execute("DELETE FROM recover_state")
+        await self._conn.commit()
 
     # ---------- scanned files (اسکن کانال) ----------
     async def add_scanned_files(self, channel_id: str, items: list[dict]):

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -708,6 +709,192 @@ class ChannelScanner:
             logger.exception("delete_duplicates failed")
             return False, f"❌ خطا در حذف: {str(e)[:150]}", 0
 
+
+    # ---------- بازیابی فیلم‌های پاک‌شده (از Recent Actions / Admin Log) ----------
+    async def scan_deleted_media(self, peer: str, hints: Optional[dict] = None, max_events: int = 300):
+        """بررسی Admin Log برای پیام‌های حذف‌شده با مدیا (فیلم/فایل).
+        برمی‌گردونه: (موفق, پیام, list[dict]) هر آیتم: msg_id/name/size/caption"""
+        try:
+            await self.ensure_connected()
+            if not await self._client.is_user_authorized():
+                return False, "❌ وارد نشده‌ای", []
+
+            entity = await self._resolve_entity(peer, hints)
+
+            from telethon.tl.functions.channels import GetAdminLogRequest
+            from telethon.tl.types import (
+                ChannelAdminLogEventsFilter,
+                ChannelAdminLogEventActionDeleteMessage,
+            )
+
+            events = []
+            try:
+                res = await self._client(GetAdminLogRequest(
+                    channel=entity, q="", max_id=0, min_id=0, limit=max_events,
+                    events_filter=ChannelAdminLogEventsFilter(
+                        delete=True, send=True,
+                    ),
+                ))
+                events = res.events
+            except Exception:
+                # فیلتر پشتیبانی نشد → بدون فیلتر، خودمون فیلتر می‌کنیم
+                res = await self._client(GetAdminLogRequest(
+                    channel=entity, q="", max_id=0, min_id=0, limit=max_events,
+                ))
+                events = res.events
+
+            found = []
+            for ev in events:
+                if not isinstance(ev.action, ChannelAdminLogEventActionDeleteMessage):
+                    continue
+                msg = ev.action.message
+                media = getattr(msg, "document", None) or getattr(msg, "video", None)
+                if media is None:
+                    continue
+                name = ""
+                for attr in getattr(media, "attributes", []):
+                    if isinstance(attr, DocumentAttributeFilename):
+                        name = attr.file_name or ""
+                found.append({
+                    "msg_id": msg.id,
+                    "name": name or "بدون اسم",
+                    "size": getattr(media, "size", 0) or 0,
+                    "caption": msg.message or "",
+                })
+
+            total_mb = sum(f["size"] for f in found) / (1024 * 1024)
+            msg_out = (
+                f"🔍 {len(found)} فیلم حذف‌شده در Recent Actions پیدا شد"
+                + (f" (مجموعاً {total_mb:.0f}MB)" if found else "")
+            )
+            return True, msg_out, found
+        except Exception as e:
+            logger.exception("scan_deleted_media failed")
+            return False, f"❌ خطا: {str(e)[:150]}", []
+
+    async def recover_deleted(self, peer: str, hints: Optional[dict] = None,
+                               progress_cb=None, max_events: int = 300):
+        """بازیابی فیلم‌های پاک‌شده با قابلیت ادامه از جایی که قطع شد.
+        - پیشرفت (msg_id های موفق) توی دیتابیس ذخیره می‌شه
+        - اگه وسط کار قطع بشه، دفعه بعد از همونجا ادامه می‌ده
+        - فایل‌های نیمه‌دانلود توی recover_tmp می‌مونن و دوباره دانلود نمی‌شن
+        برمی‌گردونه: (موفق, پیام, تعداد موفق, تعداد ناموفق)"""
+        try:
+            await self.ensure_connected()
+            if not await self._client.is_user_authorized():
+                return False, "❌ وارد نشده‌ای", 0, 0
+
+            entity = await self._resolve_entity(peer, hints)
+            channel_id = str(entity.id)
+
+            from telethon.tl.functions.channels import GetAdminLogRequest
+            from telethon.tl.types import (
+                ChannelAdminLogEventsFilter,
+                ChannelAdminLogEventActionDeleteMessage,
+            )
+
+            events = []
+            try:
+                res = await self._client(GetAdminLogRequest(
+                    channel=entity, q="", max_id=0, min_id=0, limit=max_events,
+                    events_filter=ChannelAdminLogEventsFilter(delete=True, send=True),
+                ))
+                events = res.events
+            except Exception:
+                res = await self._client(GetAdminLogRequest(
+                    channel=entity, q="", max_id=0, min_id=0, limit=max_events,
+                ))
+                events = res.events
+
+            deleted_msgs = [
+                e.action.message for e in events
+                if isinstance(e.action, ChannelAdminLogEventActionDeleteMessage)
+                and (e.action.message.document or e.action.message.video)
+            ]
+
+            if not deleted_msgs:
+                return True, "چیزی برای بازیابی نیست.", 0, 0
+
+            # ---------- پیشرفت ذخیره‌شده (از دیتابیس) ----------
+            state = await db.get_recover_state(channel_id) or {}
+            done_ids = set(state.get("done_ids") or [])      # msg_id های موفق قبلی (دیگه تکرار نمی‌شن)
+            fail_ids = set(state.get("fail_ids") or [])      # msg_id های ناموفق قبلی (دوباره تلاش می‌شن)
+            tmp_dir = DATA_DIR / "recover_tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            # فقط پیام‌هایی که هنوز موفق نشدن (ناموفق‌ها دوباره تلاش می‌شن — شاید خطا موقتی بود)
+            todo = [m for m in deleted_msgs if m.id not in done_ids]
+            skipped = len(done_ids)  # تعداد از قبل موفق
+
+            # فایل‌های نیمه‌دانلود: اگه فایل روی دیسک هست، دوباره دانلود نکن
+            for m in todo:
+                existing = tmp_dir / f"recover_{m.id}"
+                if existing.exists() and existing.stat().st_size > 0:
+                    # فایل هست — فقط آپلودش کن
+                    try:
+                        await self._client.send_file(entity, str(existing), caption=m.message or "")
+                        done_ids.add(m.id)
+                        try:
+                            existing.unlink()
+                        except Exception:
+                            pass
+                        continue
+                    except Exception:
+                        pass
+
+            # شمارش جدیدِ همین اجرا (نه مجموع قبلی)
+            recovered = 0
+            failed = 0
+            total = len(deleted_msgs)
+            prev_done = len(done_ids)
+            prev_fail = len(fail_ids)
+
+            for i, msg in enumerate(todo, 1):
+                if progress_cb:
+                    done_so_far = prev_done + recovered + failed
+                    await progress_cb(f"⏳ [{done_so_far + i}/{total}] دانلود و آپلود دوباره...")
+                try:
+                    path = await self._client.download_media(
+                        msg, file=str(tmp_dir / f"recover_{msg.id}")
+                    )
+                    if not path:
+                        fail_ids.add(msg.id)
+                        failed += 1
+                        await db.save_recover_state(channel_id, done_ids, fail_ids)
+                        continue
+                    # پست دوباره با کپشن اصلی
+                    await self._client.send_file(entity, path, caption=msg.message or "")
+                    done_ids.add(msg.id)
+                    recovered += 1
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"recover msg {msg.id} failed: {e}")
+                    fail_ids.add(msg.id)
+                    failed += 1
+                # 💾 ذخیره پیشرفت بعد از هر پیام — اگه قطع بشه، از اینجا ادامه می‌ده
+                try:
+                    await db.save_recover_state(channel_id, done_ids, fail_ids)
+                except Exception:
+                    pass
+
+            state = await db.get_recover_state(channel_id)
+            resume_note = ""
+            if state and state.get("updated_at"):
+                resume_note = f"\n🕒 آخرین اجرا: {time.strftime('%Y-%m-%d %H:%M', time.localtime(state['updated_at']))}"
+
+            total_ok = prev_done + recovered
+            msg_out = (
+                f"♻️ بازیابی: این بار {recovered} موفق، {failed} ناموفق"
+                + (f" — مجموع موفق: {total_ok} از {total}" if total > 0 else "")
+                + resume_note
+            )
+            return True, msg_out, recovered, failed
+        except Exception as e:
+            logger.exception("recover_deleted failed")
+            return False, f"❌ خطا: {str(e)[:150]}", 0, 0
 
 import asyncio  # noqa: E402
 
