@@ -543,6 +543,95 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    if data == "scan_recover":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if not rows:
+            await query.edit_message_text(
+                "اول یه کانال ثبت کن (فوروارد یا آیدی) بعد بازیابی کن.",
+                reply_markup=back_only(),
+            )
+            return
+        kb_rows = [
+            [InlineKeyboardButton(
+                f"♻️ {_esc(str(rows[i]['title'] or rows[i]['chat_id']))[:25]}",
+                callback_data=f"scan_rec_{i}"
+            )]
+            for i in range(min(len(rows), 8))
+        ]
+        kb_rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_scanner")])
+        await query.edit_message_text(
+            "🗑 کدوم کانال؟ فیلم‌های پاک‌شده‌ش از Recent Actions بازیابی می‌شن (با کپشن اصلی).\n"
+            "⚠️ هر چی زودتر — ارجاع فایل‌ها ممکنه منقضی بشه!",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+        return
+
+    if data.startswith("scan_rec_"):
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        try:
+            idx = int(data.split("_")[2])
+        except ValueError:
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if idx < 0 or idx >= len(rows):
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        ch = rows[idx]
+        peer = ch["chat_id"]
+        hints = {"id": ch["chat_id"], "title": ch["title"] or "", "username": ch["username"] or ""}
+        if ch["username"]:
+            peer = "@" + ch["username"]
+        context.user_data["recover_peer"] = peer
+        context.user_data["recover_hints"] = hints
+        await query.edit_message_text("🔍 در حال بررسی Recent Actions کانال...")
+        ok, msg, found = await scanner.scan_deleted_media(peer, hints)
+        if not ok:
+            await query.edit_message_text(msg, reply_markup=scanner_menu(True))
+            return
+        if not found:
+            await query.edit_message_text(
+                f"{msg}\n\n🎉 چیزی برای بازیابی نیست (یا ارجاع فایل‌ها منقضی شده).",
+                reply_markup=scanner_menu(True),
+            )
+            return
+        samples = "\n".join(
+            f"• {_esc(f['name'][:40])} | {f['size'] / (1024 * 1024):.0f}MB"
+            for f in found[:5]
+        )
+        more = f"\n… و {len(found) - 5} فیلم دیگر" if len(found) > 5 else ""
+        await query.edit_message_text(
+            f"{msg}\n\n{samples}{more}\n\n"
+            f"این فیلم‌ها با کپشن اصلیشون دوباره توی کانال پست می‌شن. شروع کنم؟",
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard("scan_recover_confirm", "scan_cancel_delete"),
+        )
+        return
+
+    if data == "scan_recover_confirm":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        peer = context.user_data.get("recover_peer", "")
+        hints = context.user_data.get("recover_hints") or {}
+        if not peer:
+            await query.answer("اول کانال رو انتخاب کن", show_alert=True)
+            return
+        status = await query.edit_message_text("♻️ شروع بازیابی... (فایل‌های بزرگ چند دقیقه طول می‌کشه)")
+        async def progress(v):
+            try:
+                await status.edit_text(str(v))
+            except Exception:
+                pass
+        ok, msg, rec, fail = await scanner.recover_deleted(peer, hints, progress_cb=progress)
+        await status.edit_text(msg, reply_markup=scanner_menu(True))
+        return
+
     if data == "scan_link_all":
         if not settings.is_admin(user_id):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
@@ -687,6 +776,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "scan_confirm_delete_suspect":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        channel_id = context.user_data.get("scan_groups_channel", "")
+        stored = context.user_data.get("scan_groups") or {}
+        suspect_groups = stored.get("suspect") or []
+        if not channel_id or not suspect_groups:
+            await query.answer("اول اسکن کن", show_alert=True)
+            return
+        total_dups = sum(len(g["dups"]) for g in suspect_groups)
+        # ⚠️ هشدار قرمز: اینا قطعی نیستن!
+        await query.edit_message_text(
+            f"🚨⚠️ {total_dups} فایل «احتمالی» حذف بشه؟!\n\n"
+            f"این فایل‌ها فقط «شبیه» هستن (حجم/مدت نزدیک) — ممکنه اصلاً تکراری نباشن!\n"
+            f"قبل از حذف حتماً با «👁 ببین» چک کن.\n"
+            f"از هر گروه فقط قدیمی‌ترین می‌مونه — بقیه برای همیشه پاک می‌شن و قابل برگشت نیست!",
+            reply_markup=confirm_keyboard("scan_confirm_delete_suspect_yes", "scan_cancel_delete"),
+        )
+        return
+
+    if data == "scan_confirm_delete_suspect_yes":
         if not settings.is_admin(user_id):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return
@@ -1054,7 +1164,7 @@ async def show_duplicate_report(update, context, status, msg, channel_id, found)
     if sure_groups:
         kb_rows.append([InlineKeyboardButton("✅ حذف تکراری‌های قطعی", callback_data="scan_confirm_delete")])
     if suspect_groups:
-        kb_rows.append([InlineKeyboardButton("🗑 حذف احتمالی‌ها (بعد از چک خودت)", callback_data="scan_confirm_delete_suspect")])
+        kb_rows.append([InlineKeyboardButton("🗑 حذف احتمالی‌ها (⚠️ فقط بعد از چک با 👁)", callback_data="scan_confirm_delete_suspect")])
     kb_rows.append([InlineKeyboardButton("❌ انصراف", callback_data="scan_cancel_delete")])
     kb = InlineKeyboardMarkup(kb_rows)
 
