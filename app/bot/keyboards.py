@@ -4,9 +4,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
-            InlineKeyboardButton("📡 اسکن کانال (تکراری‌یاب)", callback_data="menu_scanner"),
-        ],
-        [
             InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"),
         ],
     ]

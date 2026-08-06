@@ -314,7 +314,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, r in enumerate(rows[:10], 1):
             name = r["title"] or r["chat_id"]
             uname = f" (@{r['username']})" if r["username"] else ""
-            lines.append(f"{i}. {_esc(name)}{uname}")
+            has_result = await db.get_scan_result(r["chat_id"]) is not None
+            mark = " ✅" if has_result else ""
+            lines.append(f"{i}. {_esc(name)}{uname}{mark}")
         lines.append("")
         lines.append("با دکمه‌های پایین انتخاب کن. «➕» برای ثبت کانال جدید.")
 
@@ -456,9 +458,59 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_SCAN_CHANNEL
 
     if data == "scan_clear_data":
+        rows = await db.list_channels()
+        total_files = await db.count_scanned_files()
+        lines = [
+            "🗑 پاک‌سازی داده‌های اسکن",
+            "",
+            f"• کل فایل‌های ثبت‌شده: {total_files}",
+            "",
+        ]
+        if rows:
+            lines.append("کدوم کانال پاک بشه؟ (فایل‌ها + نتیجه اسکنش):")
+        else:
+            lines.append("کانالی ثبت نشده — فقط می‌تونی همه رو پاک کنی.")
+        kb_rows = []
+        for i in range(min(len(rows), 8)):
+            name = rows[i]["title"] or rows[i]["chat_id"]
+            kb_rows.append([InlineKeyboardButton(f"🗑 {_esc(str(name))[:25]}", callback_data=f"scan_clear_chan_{i}")])
+        kb_rows.append([InlineKeyboardButton("🧹 پاک کردن همه (همه کانال‌ها)", callback_data="scan_clear_all")])
+        kb_rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_scanner")])
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+        return
+
+    if data.startswith("scan_clear_chan_"):
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        try:
+            idx = int(data.split("_")[3])
+        except ValueError:
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if idx < 0 or idx >= len(rows):
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        ch = rows[idx]
+        await db.clear_channel_data(ch["chat_id"])
+        await query.edit_message_text(
+            f"🗑 داده‌های «{_esc(ch['title'] or ch['chat_id'])}» پاک شد (فایل‌ها + نتیجه).",
+            reply_markup=scanner_menu(True),
+        )
+        return
+
+    if data == "scan_clear_all":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
         await db.clear_scanned_files()
         await query.edit_message_text(
-            "🗑 داده‌ی اسکن (فایل‌های ثبت‌شده) پاک شد.",
+            "🧹 همه داده‌های اسکن (همه کانال‌ها) پاک شد — فضا آزاد شد.",
             reply_markup=scanner_menu(await scanner.is_logged_in()),
         )
         return
@@ -472,6 +524,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🚪 از حساب اسکنر خارج شدی." if ok else "⚠️ مشکلی پیش اومد (شاید از قبل خارج شده بودی).",
             reply_markup=scanner_menu(False),
         )
+        return
+
+    if data == "scan_back_to_result":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        channel_id = context.user_data.get("scan_groups_channel", "")
+        stored = context.user_data.get("scan_groups") or {}
+        if not channel_id or not stored:
+            await query.answer("اول اسکن کن", show_alert=True)
+            return
+        found = {"sure": stored.get("sure") or [], "suspect": stored.get("suspect") or [], "debug": ""}
+        msg = f"✅ نتیجه اسکن — 📡 `{_esc(channel_id)}`"
+        try:
+            await show_duplicate_report(update, context, query.message, msg, channel_id, found)
+        except Exception:
+            pass
         return
 
     if data == "scan_link_all":
@@ -552,10 +621,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     nm = it["filename"] or "بدون اسم"
                     lines.append(f"  • {link} | {nm[:30]} | {size_mb:.0f}MB")
             text_out = "\n".join(lines)
+            back_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت به نتیجه اسکن", callback_data="scan_back_to_result")],
+                [InlineKeyboardButton("🏠 منو", callback_data="back_main")],
+            ])
             try:
-                await query.message.reply_text(text_out, reply_markup=scanner_menu(True))
+                await query.message.reply_text(text_out, reply_markup=back_kb)
             except Exception:
-                await query.message.reply_text(text_out, reply_markup=scanner_menu(True))
+                await query.message.reply_text(text_out, reply_markup=back_kb)
             try:
                 await query.edit_message_text("🔗 لینک‌ها فرستاده شد — روی هر کدوم بزن تا ویدیو رو ببینی.")
             except Exception:
@@ -584,6 +657,25 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "scan_confirm_delete":
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        channel_id = context.user_data.get("scan_groups_channel", "")
+        stored = context.user_data.get("scan_groups") or {}
+        sure_groups = stored.get("sure") or []
+        if not channel_id or not sure_groups:
+            await query.answer("اول اسکن کن", show_alert=True)
+            return
+        total_dups = sum(len(g["dups"]) for g in sure_groups)
+        await query.edit_message_text(
+            f"⚠️ {total_dups} فایل تکراری قطعی حذف بشه?\n\n"
+            f"از هر گروه فقط «قدیمی‌ترین نسخه» می‌مونه و بقیه حذف می‌شن.\n"
+            f"این کار قابل برگشت نیست!",
+            reply_markup=confirm_keyboard("scan_confirm_delete_yes", "scan_cancel_delete"),
+        )
+        return
+
+    if data == "scan_confirm_delete_yes":
         if not settings.is_admin(user_id):
             await query.answer("⛔ دسترسی ندارید", show_alert=True)
             return

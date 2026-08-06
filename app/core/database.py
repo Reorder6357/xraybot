@@ -184,6 +184,21 @@ class Database:
             await self._conn.execute("DELETE FROM scanned_files")
         await self._conn.commit()
 
+    async def clear_channel_data(self, channel_id: str):
+        """پاک کردن همه داده‌های یک کانال (فایل‌های اسکن‌شده + نتیجه) — آزاد کردن فضا"""
+        await self._conn.execute(
+            "DELETE FROM scanned_files WHERE channel_id = ?", (channel_id,)
+        )
+        await self._conn.execute(
+            "DELETE FROM scan_results WHERE channel_id = ?", (channel_id,)
+        )
+        await self._conn.commit()
+
+    async def count_scanned_files(self) -> int:
+        cur = await self._conn.execute("SELECT COUNT(*) AS c FROM scanned_files")
+        row = await cur.fetchone()
+        return int(row["c"]) if row else 0
+
     async def delete_scanned_by_msg_ids(self, channel_id: str, msg_ids: list[int]):
         if not msg_ids:
             return
