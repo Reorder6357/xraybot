@@ -123,23 +123,60 @@ class ChannelScanner:
             entity = await self._resolve_entity(peer)
             channel_id = str(entity.id)
 
+            # ---- بررسی دسترسی: تعداد کل پیام‌های قابل‌دسترس ----
+            total = 0
+            try:
+                one = await self._client.get_messages(entity, limit=1)
+                total = getattr(one, "total", 0) or 0
+            except Exception:
+                pass
+
             files: list[dict] = []
             count = 0
-            async for msg in self._client.iter_messages(entity, limit=max_messages):
-                if isinstance(msg, Message) and msg.document:
+            async for msg in self._client.iter_messages(entity, limit=max_messages, wait_time=0.4):
+                media = None
+                if msg.document:
+                    media = ("doc", msg.document)
+                elif msg.video:
+                    media = ("video", msg.video)
+                elif getattr(msg, "gif", None):
+                    media = ("gif", msg.gif)
+                elif msg.photo:
+                    media = ("photo", msg.photo)
+
+                if media:
+                    kind, m = media
                     filename = ""
                     duration = 0.0
-                    is_video = False
-                    for attr in msg.document.attributes:
-                        if isinstance(attr, DocumentAttributeFilename):
-                            filename = attr.file_name or ""
-                        elif isinstance(attr, DocumentAttributeVideo):
-                            duration = float(attr.duration or 0)
-                            is_video = True
+                    is_video = kind in ("video", "gif")
+                    size = 0
+
+                    if kind == "doc":
+                        for attr in m.attributes:
+                            if isinstance(attr, DocumentAttributeFilename):
+                                filename = attr.file_name or ""
+                            elif isinstance(attr, DocumentAttributeVideo):
+                                duration = float(attr.duration or 0)
+                                is_video = True
+                        size = m.size or 0
+                    elif kind in ("video", "gif"):
+                        # ویدیوهای ارسال‌شده به‌صورت ویدیو اسم فایل مستقیم ندارن
+                        filename = ""
+                        duration = float(getattr(m, "duration", 0) or 0)
+                        size = getattr(m, "size", 0) or 0
+                    elif kind == "photo":
+                        # سایز عکس از بزرگترین سایزش
+                        try:
+                            sizes = getattr(m, "sizes", [])
+                            if sizes:
+                                size = getattr(sizes[-1], "size", 0) or 0
+                        except Exception:
+                            pass
+
                     files.append({
                         "msg_id": msg.id,
                         "filename": filename,
-                        "size": msg.document.size or 0,
+                        "size": size,
                         "duration": duration,
                         "is_video": is_video,
                         "date": msg.date.timestamp() if msg.date else 0,
@@ -150,10 +187,21 @@ class ChannelScanner:
 
             await db.add_scanned_files(channel_id, files)
 
+            # ---- گزارش + هشدار اگه دسترسی کامل نبود ----
+            warn = ""
+            if total > 0 and count < total:
+                warn = (
+                    f"\n\n⚠️ فقط {count} از {total} پیام قابل دسترسی بود!\n"
+                    f"مطمئن شو اکانت اسکنر توی کانال «ادمین» باشه و تیک «خواندن پیام‌ها/Read messages» فعال باشه.\n"
+                    f"(اگه کانال خصوصیه، اکانت باید عضو/ادمین باشه تا تاریخچه کامل دیده بشه)"
+                )
+
             msg = (
                 f"✅ اسکن تموم شد\n"
+                f"• کل پیام‌های کانال: {total if total > 0 else 'نامشخص'}\n"
                 f"• پیام‌های بررسی‌شده: {count}\n"
-                f"• فایل/ویدیو پیدا شد: {len(files)}"
+                f"• فایل/ویدیو/عکس پیدا شد: {len(files)}"
+                + warn
             )
             return True, msg, len(files)
         except Exception as e:
