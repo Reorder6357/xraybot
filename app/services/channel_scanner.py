@@ -54,7 +54,7 @@ class ChannelScanner:
         client = self._ensure_client()
         if not client.is_connected():
             await client.connect()
-        client.flood_sleep_threshold = FLOOD_SLEEP
+        client.flood_sleep_threshold = FLOOD_SLEEP  # 60s
 
     async def is_logged_in(self) -> bool:
         try:
@@ -173,7 +173,8 @@ class ChannelScanner:
 
             files: list[dict] = []
             count = 0
-            async for msg in self._client.iter_messages(entity, limit=max_messages, wait_time=0.4):
+            stats = {"video": 0, "doc": 0, "gif": 0, "photo": 0, "text": 0, "other": 0}
+            async for msg in self._client.iter_messages(entity, limit=max_messages, wait_time=0):
                 media = None
                 if msg.document:
                     media = ("doc", msg.document)
@@ -186,6 +187,7 @@ class ChannelScanner:
 
                 if media:
                     kind, m = media
+                    stats[kind] = stats.get(kind, 0) + 1
                     filename = ""
                     duration = 0.0
                     is_video = kind in ("video", "gif")
@@ -221,9 +223,17 @@ class ChannelScanner:
                         "is_video": is_video,
                         "date": msg.date.timestamp() if msg.date else 0,
                     })
+                else:
+                    # بدون مدیا: متن یا سایر
+                    if msg.text:
+                        stats["text"] += 1
+                    else:
+                        stats["other"] += 1
                 count += 1
                 if progress_cb and count % SCAN_BATCH_PROGRESS == 0:
                     await progress_cb(count)
+                if count % 500 == 0:
+                    logger.info(f"Scan progress: {count} messages, {len(files)} files so far")
 
             await db.add_scanned_files(channel_id, files)
 
@@ -236,13 +246,20 @@ class ChannelScanner:
                     f"(اگه کانال خصوصیه، اکانت باید عضو/ادمین باشه تا تاریخچه کامل دیده بشه)"
                 )
 
+            # خلاصه انواع پیام‌ها (برای دیباگ)
+            breakdown = " | ".join(f"{k}: {v}" for k, v in stats.items() if v > 0)
             msg = (
                 f"✅ اسکن تموم شد\n"
                 f"• کل پیام‌های کانال: {total if total > 0 else 'نامشخص'}\n"
                 f"• پیام‌های بررسی‌شده: {count}\n"
-                f"• فایل/ویدیو/عکس پیدا شد: {len(files)}"
+                f"• ویدیو پیدا شد: {stats['video']}\n"
+                f"• فایل پیدا شد: {stats['doc']}\n"
+                f"• عکس: {stats['photo']} | گیف: {stats['gif']}\n"
+                f"• متن: {stats['text']} | سایر: {stats['other']}\n"
+                f"• مجموع مدیا: {len(files)}"
                 + warn
             )
+            logger.info(f"Scan finished: total={total} checked={count} files={len(files)} breakdown={breakdown}")
             return True, msg, len(files)
         except Exception as e:
             logger.exception("scan_channel failed")
