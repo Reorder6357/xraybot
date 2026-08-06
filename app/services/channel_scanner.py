@@ -728,12 +728,18 @@ class ChannelScanner:
             from telethon.tl.functions.channels import (
                 GetParticipantRequest, EditAdminRequest,
             )
-            from telethon.tl.types import ChatAdminRights, InputUser
+            from telethon.tl.types import ChatAdminRights
+
+            # 🔑 درست: get_input_entity خودش access_hash واقعی رو از کش می‌گیره
+            try:
+                me_input = await self._client.get_input_entity("me")
+            except Exception as e:
+                return False, f"❌ اکانت اسکنر پیدا نشد: {str(e)[:80]}"
 
             # دسترسی‌های فعلی ادمین اسکنر
             try:
                 part = await self._client(GetParticipantRequest(
-                    channel=entity, participant=InputUser(me.id, me.access_hash)
+                    channel=entity, participant=me_input
                 ))
                 rights = part.participant.admin_rights
             except Exception as e:
@@ -743,7 +749,7 @@ class ChannelScanner:
             try:
                 await self._client(EditAdminRequest(
                     channel=entity,
-                    user_id=InputUser(me.id, me.access_hash),
+                    user_id=me_input,
                     admin_rights=ChatAdminRights(),
                     rank="",
                 ))
@@ -754,7 +760,7 @@ class ChannelScanner:
             try:
                 await self._client(EditAdminRequest(
                     channel=entity,
-                    user_id=InputUser(me.id, me.access_hash),
+                    user_id=me_input,
                     admin_rights=rights,
                     rank="",
                 ))
