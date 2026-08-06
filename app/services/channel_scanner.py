@@ -55,8 +55,15 @@ class ChannelScanner:
     async def ensure_connected(self):
         client = self._ensure_client()
         if not client.is_connected():
-            await client.connect()
-        client.flood_sleep_threshold = FLOOD_SLEEP  # 60s
+            try:
+                await asyncio.wait_for(client.connect(), timeout=30)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    "اتصال به تلگرام برقرار نشد (مشکل شبکه/سرور). چند دقیقه دیگه دوباره تلاش کن."
+                )
+        # flood_sleep_threshold=1: هر محدودیتی به‌صورت خطا سطح می‌شه و ما خودمون
+        # مدیریتش می‌کنیم (با پیام به کاربر) — نه صبر بی‌صدای Telethon
+        client.flood_sleep_threshold = 1
 
     async def is_logged_in(self) -> bool:
         try:
@@ -163,7 +170,16 @@ class ChannelScanner:
             if not await self._client.is_user_authorized():
                 return False, "❌ اول باید با شماره وارد بشی (دکمه ورود)", 0
 
-            entity = await self._resolve_entity(peer, hints)
+            if progress_cb:
+                try:
+                    await progress_cb("🔌 متصل شد — در حال پیدا کردن کانال...")
+                except Exception:
+                    pass
+
+            try:
+                entity = await asyncio.wait_for(self._resolve_entity(peer, hints), timeout=60)
+            except asyncio.TimeoutError:
+                return False, "❌ پیدا کردن کانال طول کشید (مشکل شبکه). دوباره تلاش کن.", 0
             channel_id = str(entity.id)
             chan_title = getattr(entity, "title", "") or ""
             chan_uname = getattr(entity, "username", "")
@@ -178,6 +194,16 @@ class ChannelScanner:
             except Exception:
                 pass
 
+            # اطلاع‌رسانی اولیه: چند تا پیام/کلیپ اسکن می‌شه
+            if progress_cb:
+                try:
+                    if total > 0:
+                        await progress_cb(f"📊 {total} پیام/کلیپ در کانال پیدا شد — شروع اسکن...")
+                    else:
+                        await progress_cb("📊 در حال دریافت اطلاعات کانال...")
+                except Exception:
+                    pass
+
             files: list[dict] = []
             count = 0
             stats = {"video": 0, "doc": 0, "gif": 0, "photo": 0, "text": 0, "other": 0}
@@ -188,6 +214,7 @@ class ChannelScanner:
             t_start = time.time()
             offset_id = 0
             capped = False
+            retries = 0
 
             while True:
                 # سقف زمانی
@@ -199,13 +226,29 @@ class ChannelScanner:
                     break
 
                 try:
-                    batch = await self._client.get_messages(
-                        entity, limit=CHUNK, offset_id=offset_id
+                    batch = await asyncio.wait_for(
+                        self._client.get_messages(entity, limit=CHUNK, offset_id=offset_id),
+                        timeout=30,
                     )
+                except asyncio.TimeoutError:
+                    logger.warning(f"get_messages timeout at {count}")
+                    retries += 1
+                    if retries >= 3:
+                        logger.warning("Too many timeouts, stopping scan")
+                        break
+                    if progress_cb:
+                        try:
+                            await progress_cb(
+                                f"⚠️ اتصال کند — تلاش مجدد... (تا الان {count} پیام)"
+                            )
+                        except Exception:
+                            pass
+                    await asyncio.sleep(3)
+                    continue
                 except FloodWaitError as e:
                     secs = int(getattr(e, "seconds", 30) or 30)
                     logger.warning(f"FloodWait {secs}s while scanning (at {count})")
-                    if progress_cb:
+                    if secs >= 10 and progress_cb:
                         try:
                             await progress_cb(
                                 f"⚠️ محدودیت تلگرام — {secs} ثانیه صبر کن... (تا الان {count} پیام)"
@@ -217,6 +260,8 @@ class ChannelScanner:
                 except Exception as e:
                     logger.warning(f"get_messages failed at {count}: {e}")
                     break
+
+                retries = 0  # موفق شد → ریست تلاش‌ها
 
                 if not batch:
                     break
@@ -283,7 +328,10 @@ class ChannelScanner:
                     break
 
                 if progress_cb and count % SCAN_BATCH_PROGRESS == 0:
-                    await progress_cb(count)
+                    if total > 0:
+                        await progress_cb(f"⏳ مرحله {count} از {total}...")
+                    else:
+                        await progress_cb(count)
                 if count % 500 == 0:
                     logger.info(f"Scan progress: {count} messages, {len(files)} files so far")
 

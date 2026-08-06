@@ -20,8 +20,8 @@ def main_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
 def scanner_menu(login_status: bool = False) -> InlineKeyboardMarkup:
     btn1 = "🔑 ورود با شماره (لاگین)" if not login_status else "✅ وارد شده‌اید"
     rows = [
+        [InlineKeyboardButton("📋 کانال‌های ثبت‌شده", callback_data="scan_channels_list")],
         [InlineKeyboardButton(btn1, callback_data="scan_login")],
-        [InlineKeyboardButton("📡 اسکن کانال", callback_data="scan_channel")],
     ]
     if login_status:
         rows.append([InlineKeyboardButton("🚪 خروج از حساب اسکنر", callback_data="scan_logout")])

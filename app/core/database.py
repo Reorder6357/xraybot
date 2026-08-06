@@ -29,6 +29,14 @@ class Database:
                 value TEXT NOT NULL
             );
 
+            -- کانال‌های ثبت‌شده (برای اسکن سریع)
+            CREATE TABLE IF NOT EXISTS channels (
+                chat_id TEXT PRIMARY KEY,
+                title TEXT,
+                username TEXT,
+                added_at REAL
+            );
+
             -- فایل‌های اسکن‌شده در کانال (برای تشخیص تکراری)
             CREATE TABLE IF NOT EXISTS scanned_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +72,35 @@ class Database:
             (key, json.dumps(value, ensure_ascii=False)),
         )
         await self._conn.commit()
+
+    # ---------- channels (کانال‌های ثبت‌شده) ----------
+    async def add_channel(self, chat_id: str, title: str = "", username: str = ""):
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO channels (chat_id, title, username, added_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(chat_id), title, username, time.time()),
+        )
+        await self._conn.commit()
+
+    async def list_channels(self) -> list:
+        cur = await self._conn.execute(
+            "SELECT * FROM channels ORDER BY added_at DESC LIMIT 50"
+        )
+        return await cur.fetchall()
+
+    async def remove_channel(self, chat_id: str):
+        await self._conn.execute(
+            "DELETE FROM channels WHERE chat_id = ?", (str(chat_id),)
+        )
+        await self._conn.commit()
+
+    async def get_channel(self, chat_id: str):
+        cur = await self._conn.execute(
+            "SELECT * FROM channels WHERE chat_id = ?", (str(chat_id),)
+        )
+        return await cur.fetchone()
 
     # ---------- scanned files (اسکن کانال) ----------
     async def add_scanned_files(self, channel_id: str, items: list[dict]):

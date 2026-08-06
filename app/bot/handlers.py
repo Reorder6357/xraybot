@@ -188,12 +188,31 @@ def admin_only(func):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_owner = settings.is_owner(user.id)
-    text = (
-        f"سلام {user.first_name} 👋\n\n"
-        "ربات اسکن کانال — پیدا کردن فایل‌های تکراری.\n"
-        "از دکمه‌های زیر استفاده کن:"
+
+    # حذف دکمه‌های ثابت قدیمی (ReplyKeyboard) که از نسخه‌های قبل مونده
+    from telegram import ReplyKeyboardRemove
+    try:
+        await update.effective_message.reply_text(
+            "⌨️ پاک‌سازی دکمه‌های قدیمی...", reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception:
+        pass
+
+    # مستقیم منوی اسکن
+    logged = await scanner.is_logged_in()
+    info = ""
+    if logged:
+        who = await scanner.get_login_info()
+        info = f"\n👤 وارد شده با: `{who}`" if who else ""
+    status = "✅ وارد شده‌اید" if logged else "❌ هنوز وارد نشده‌اید"
+    await update.effective_message.reply_text(
+        f"📡 اسکن کانال برای پیدا کردن فایل‌های تکراری\n\n{status}{info}\n\n"
+        f"۱) کانال رو ثبت کن (با آیدی/یوزرنیم یا فوروارد)\n"
+        f"۲) از لیست کانال‌های ثبت‌شده انتخاب کن و اسکن بزن\n"
+        f"۳) گزارش تکراری‌ها + تأیید حذف",
+        parse_mode="Markdown",
+        reply_markup=scanner_menu(logged),
     )
-    await update.effective_message.reply_text(text, reply_markup=main_menu(is_owner))
 
 
 # -------------------- Callback router --------------------
@@ -275,6 +294,116 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # تبدیل callback به یک پیام جدید تا reply_text کار کنه
         await query.edit_message_text(f"⏳ شروع اسکن کانال «{hints.get('title') or peer}»...")
         await _start_scan_for_peer(update, context, peer, hints)
+        return
+
+    if data == "scan_channels_list":
+        rows = await db.list_channels()
+        if not rows:
+            await query.edit_message_text(
+                "📭 هنوز کانالی ثبت نشده.\n\n"
+                "برای ثبت:\n"
+                "• از کانال یه پیام/ویدیو فوروارد کن (خودکار ثبت می‌شه)\n"
+                "• یا آیدی/یوزرنیم کانال رو بفرست: `@channel` یا `-1001234567890`",
+                parse_mode="Markdown",
+                reply_markup=back_only(),
+            )
+            return
+
+        lines = [f"📋 {len(rows)} کانال ثبت‌شده — یکی رو انتخاب کن:", ""]
+        for i, r in enumerate(rows[:10], 1):
+            name = r["title"] or r["chat_id"]
+            uname = f" (@{r['username']})" if r["username"] else ""
+            lines.append(f"{i}. {_esc(name)}{uname}")
+        lines.append("")
+        lines.append("با دکمه‌های پایین انتخاب کن. «➕» برای ثبت کانال جدید.")
+
+        kb_rows = []
+        for i in range(min(len(rows), 10)):
+            kb_rows.append([
+                InlineKeyboardButton(f"📡 اسکن {i+1}", callback_data=f"scan_choose_{i}"),
+            ])
+        kb_rows.append([
+            InlineKeyboardButton("➕ ثبت کانال جدید", callback_data="scan_add_manual"),
+            InlineKeyboardButton("🗑 حذف کانال", callback_data="scan_remove_channel"),
+        ])
+        kb_rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")])
+
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+        return
+
+    if data == "scan_choose_":
+        return
+
+    if data.startswith("scan_choose_"):
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        try:
+            idx = int(data.split("_")[2])
+        except ValueError:
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if idx < 0 or idx >= len(rows):
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        ch = rows[idx]
+        peer = ch["chat_id"]
+        hints = {"id": ch["chat_id"], "title": ch["title"] or "", "username": ch["username"] or ""}
+        if ch["username"]:
+            peer = "@" + ch["username"]
+        await query.edit_message_text(f"⏳ شروع اسکن کانال «{_esc(ch['title'] or peer)}»...")
+        await _start_scan_for_peer(update, context, peer, hints)
+        return
+
+    if data == "scan_add_manual":
+        await query.edit_message_text(
+            "📡 آیدی عددی یا یوزرنیم کانال رو بفرست:\n"
+            "مثال: `@mychannel` یا `-1001234567890` یا لینک `https://t.me/...`\n\n"
+            "⚠️ اکانت اسکنر باید توی اون کانال ادمین/عضو باشه.",
+            parse_mode="Markdown",
+            reply_markup=back_only(),
+        )
+        return WAIT_SCAN_CHANNEL
+
+    if data == "scan_remove_channel":
+        rows = await db.list_channels()
+        if not rows:
+            await query.answer("کانالی ثبت نشده", show_alert=True)
+            return
+        lines = [f"🗑 کدوم کانال حذف بشه؟ ({len(rows)} کانال)", ""]
+        for i, r in enumerate(rows[:10], 1):
+            name = r["title"] or r["chat_id"]
+            lines.append(f"{i}. {_esc(name)}")
+        kb_rows = [
+            [InlineKeyboardButton(f"🗑 {i+1}", callback_data=f"scan_delchan_{i}")]
+            for i in range(min(len(rows), 10))
+        ]
+        kb_rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="scan_channels_list")])
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+        return
+
+    if data.startswith("scan_delchan_"):
+        if not settings.is_admin(user_id):
+            await query.answer("⛔ دسترسی ندارید", show_alert=True)
+            return
+        try:
+            idx = int(data.split("_")[2])
+        except ValueError:
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        rows = await db.list_channels()
+        if idx < 0 or idx >= len(rows):
+            await query.answer("نامعتبر", show_alert=True)
+            return
+        await db.remove_channel(rows[idx]["chat_id"])
+        await query.edit_message_text("🗑 کانال حذف شد.", reply_markup=scanner_menu(True))
         return
 
     if data == "scan_channel":
@@ -631,6 +760,21 @@ async def received_scan_password(update: Update, context: ContextTypes.DEFAULT_T
 @admin_only
 async def received_scan_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     peer = update.effective_message.text.strip()
+
+    # ثبت کانال (اگه resolve بشه)
+    try:
+        entity = await scanner._resolve_entity(peer, None)
+        ch_id = str(entity.id)
+        await db.add_channel(
+            chat_id=ch_id,
+            title=getattr(entity, "title", "") or peer,
+            username=getattr(entity, "username", "") or "",
+        )
+        # از این به بعد با آیدی عددی اسکن کن (مطمئن‌تر)
+        peer = ch_id
+    except Exception:
+        pass
+
     status = await update.effective_message.reply_text("⏳ در حال اسکن کانال... (ممکنه چند دقیقه طول بکشه)")
 
     async def progress(value):
@@ -830,10 +974,22 @@ async def handle_forward_media(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     context.user_data["last_forward_peer"] = source
-    context.user_data["last_forward_hints"] = _forward_hints(message)
+    hints = _forward_hints(message)
+    context.user_data["last_forward_hints"] = hints
+
+    # 📌 ثبت خودکار کانال توی لیست (برای اسکن‌های بعدی بدون فوروارد)
+    try:
+        ch_id = str(hints.get("id") or source.lstrip("@") or source)
+        await db.add_channel(
+            chat_id=ch_id,
+            title=hints.get("title") or source,
+            username=hints.get("username") or "",
+        )
+    except Exception:
+        pass
 
     # 🤖 خودکار: مستقیم اسکن شروع می‌شه (اگه لاگین باشه)
-    await _start_scan_for_peer(update, context, source, context.user_data.get("last_forward_hints"))
+    await _start_scan_for_peer(update, context, source, hints)
 
 
 @admin_only
@@ -846,10 +1002,22 @@ async def handle_forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not source:
         return
     context.user_data["last_forward_peer"] = source
-    context.user_data["last_forward_hints"] = _forward_hints(message)
+    hints = _forward_hints(message)
+    context.user_data["last_forward_hints"] = hints
+
+    # 📌 ثبت خودکار کانال توی لیست
+    try:
+        ch_id = str(hints.get("id") or source.lstrip("@") or source)
+        await db.add_channel(
+            chat_id=ch_id,
+            title=hints.get("title") or source,
+            username=hints.get("username") or "",
+        )
+    except Exception:
+        pass
 
     # 🤖 خودکار: مستقیم اسکن شروع می‌شه (اگه لاگین باشه)
-    await _start_scan_for_peer(update, context, source, context.user_data.get("last_forward_hints"))
+    await _start_scan_for_peer(update, context, source, hints)
 
 
 # -------------------- آپدیت ZIP --------------------
