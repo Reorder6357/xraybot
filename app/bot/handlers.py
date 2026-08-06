@@ -1304,6 +1304,48 @@ async def handle_media_caption(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 @admin_only
+async def handle_forward_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فوروارد ویدیو/عکس/صدا/فایل بدون کپشن — تا دکمه اسکن کانال مبدأ بیاد.
+    (قبلاً این‌ها هیچ هندلری نداشتن و بی‌صدا رد می‌شدن!)"""
+    message = update.effective_message
+    if not message.forward_origin:
+        return
+
+    source = _forward_source_detail(message)
+    if not source:
+        await message.reply_text(
+            "🔍 این فوروارد منبع قابل‌تشخیصی نداره. اگه می‌خوای کانال اسکن بشه،"
+            " آیدی عددی یا یوزرنیم کانال رو مستقیم بفرست.",
+            reply_markup=back_only(),
+        )
+        return
+
+    context.user_data["last_forward_peer"] = source
+    logged = await scanner.is_logged_in()
+
+    text = (
+        f"📡 این پیام از کانال «{_esc(source)}» فوروارد شده.\n"
+        f"می‌خوای کل کانال رو اسکن کنم و تکراری‌ها رو پیدا کنم؟"
+    )
+    if not logged:
+        text += "\n\n⚠️ اول باید توی بخش «📡 اسکن کانال» با اکانت اسکنر لاگین کنی."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")],
+            [InlineKeyboardButton("🔑 ورود اسکنر", callback_data="scan_login")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📡 اسکن این کانال", callback_data="act_scan_forward")],
+        ])
+
+    try:
+        await message.reply_text(text, reply_markup=kb)
+    except Exception:
+        await message.reply_text(text, reply_markup=kb)
+    await _ensure_fixed_keyboard(update, context)
+
+
+@admin_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """فایل متنی حاوی کانفیگ"""
     message = update.effective_message
@@ -1879,6 +1921,15 @@ def setup_handlers(application: Application):
     application.add_handler(
         MessageHandler(
             filters.Text([b for b in FIXED_BUTTON_CMDS]), handle_fixed_button
+        )
+    )
+
+    # 📡 فوروارد مدیا بدون کپشن (ویدیو/عکس/صدا) → دکمه اسکن کانال
+    application.add_handler(
+        MessageHandler(
+            (filters.VIDEO | filters.PHOTO | filters.ANIMATION | filters.AUDIO
+             | filters.VOICE | filters.VIDEO_NOTE) & ~filters.CAPTION,
+            handle_forward_media,
         )
     )
 
