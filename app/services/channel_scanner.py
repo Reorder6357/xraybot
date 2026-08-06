@@ -255,7 +255,8 @@ class ChannelScanner:
                             )
                         except Exception:
                             pass
-                    await asyncio.sleep(min(secs, 120))
+                    # صبر + یه استراحت اضافه که دوباره flood نگیره
+                    await asyncio.sleep(min(secs, 120) + 2)
                     continue
                 except Exception as e:
                     logger.warning(f"get_messages failed at {count}: {e}")
@@ -336,7 +337,8 @@ class ChannelScanner:
                     logger.info(f"Scan progress: {count} messages, {len(files)} files so far")
 
                 # ریتم ملایم (جلوگیری از FloodWait)
-                await asyncio.sleep(0.4)
+                # ۱.۵ ثانیه بین هر ۱۰۰ پیام → ~۶۷ پیام/ثانیه — تلگرام محدودیت نمیزنه
+                await asyncio.sleep(1.5)
 
             if capped:
                 logger.warning("Scan capped by time limit")
@@ -489,14 +491,10 @@ class ChannelScanner:
 
     async def find_duplicates(self, channel_id: str) -> dict:
         """
-        تشخیص تکراری با تلورانس (برای کپی‌های دوباره‌آپلودشده):
-         - قطعی (sure):
-             a) اسم نرمال‌شده یکسان
-             b) حجم دقیق یکسان + مدت نزدیک (تا ۲ ثانیه) → همون فایل دوباره آپلود شده
-         - مشکوک (suspect):
-             مدت نزدیک (تا ۱۰ ثانیه) + حجم نزدیک (تا ۲۰٪) → احتمالاً همون فیلم با انکود متفاوت
+        تشخیص تکراری فقط بر اساس (حجم + مدت ویدیو) — بدون مقایسه اسم:
+         - قطعی (sure): حجم دقیقاً یکسان + مدت تا ۲ ثانیه اختلاف
+         - مشکوک (suspect): حجم تا ۳۰MB اختلاف + مدت تا ۲ ثانیه اختلاف
         خروجی: {"sure": [...], "suspect": [...], "debug": "..."}
-        debug فقط وقتی چیزی پیدا نشه پر می‌شه: نمونه داده + نزدیک‌ترین جفت‌ها
         """
         rows = await db.get_scanned_files(channel_id)
         sure_groups: list[dict] = []
@@ -519,19 +517,7 @@ class ChannelScanner:
             if ra != rb:
                 parent[rb] = ra
 
-        # ---------- ادغام قطعی ----------
-        # a) اسم نرمال‌شده
-        by_name: dict[str, list[int]] = {}
-        for i, r in enumerate(rows):
-            key = self._norm_filename(r["filename"] or "")
-            if key:
-                by_name.setdefault(key, []).append(i)
-        for key, idxs in by_name.items():
-            if len(idxs) > 1:
-                for j in idxs[1:]:
-                    union(idxs[0], j)
-
-        # b) حجم دقیق یکسان + مدت نزدیک (تا ۲ ثانیه) — با گروه‌بندی size (سریع)
+        # ---------- ادغام قطعی: حجم دقیق یکسان + مدت نزدیک (تا ۲ ثانیه) ----------
         by_size: dict[int, list[int]] = {}
         for i, r in enumerate(rows):
             sz = int(r["size"] or 0)
@@ -546,7 +532,7 @@ class ChannelScanner:
                 a = idxs_sorted[k]
                 for m in range(k + 1, len(idxs_sorted)):
                     b = idxs_sorted[m]
-                    if float(rows[b]["duration"] or 0) - float(rows[a]["duration"] or 0) > 1.0:
+                    if float(rows[b]["duration"] or 0) - float(rows[a]["duration"] or 0) > 2.0:
                         break
                     union(a, b)
 
@@ -559,21 +545,18 @@ class ChannelScanner:
             if len(items) < 2:
                 continue
             items_sorted = sorted(items, key=lambda it: (it["date"] or 0, it["msg_id"]))
-            names = {self._norm_filename(it["filename"] or "") for it in items}
-            names.discard("")
-            same_name = len(names) < len(items)
-            # بررسی: آیا جفتی با حجم دقیق یکسان + مدت نزدیک هست؟
+            # مطمئن شو حداقل یه جفت با حجم دقیق یکسان + مدت نزدیک هست
             same_exact = False
             for x in range(len(items)):
                 for y in range(x + 1, len(items)):
                     sx, sy = int(items[x]["size"] or 0), int(items[y]["size"] or 0)
                     dx, dy = float(items[x]["duration"] or 0), float(items[y]["duration"] or 0)
-                    if sx > 0 and sx == sy and abs(dx - dy) <= 1.0:
+                    if sx > 0 and sx == sy and abs(dx - dy) <= 2.0:
                         same_exact = True
                         break
                 if same_exact:
                     break
-            if same_name or same_exact:
+            if same_exact:
                 sure_groups.append({
                     "items": items_sorted,
                     "keep": items_sorted[0],
@@ -583,8 +566,7 @@ class ChannelScanner:
                     in_sure.add(it["msg_id"])
 
         # ---------- مشکوک: جفت‌های مستقیم (هر فایل یک‌بار مصرف) ----------
-        # معیار خیلی سفت: مدت تا ۱ ثانیه اختلاف + حجم تا ۳۰MB اختلاف مطلق
-        # (حتی با این معیار هم ممکنه اشتباه باشه — باید با 👁 چک کنی)
+        # حجم تا ۳۰MB اختلاف + مدت تا ۲ ثانیه اختلاف
         remaining = [r for r in rows if r["msg_id"] not in in_sure]
         if len(remaining) >= 2:
             order = sorted(range(len(remaining)), key=lambda i: float(remaining[i]["duration"] or 0))
@@ -603,7 +585,7 @@ class ChannelScanner:
                     if j in used:
                         continue
                     dj = float(remaining[j]["duration"] or 0)
-                    if dj - base_dur > 1.0:
+                    if dj - base_dur > 2.0:
                         break
                     sj = int(remaining[j]["size"] or 0)
                     if sj <= 0:
@@ -619,7 +601,7 @@ class ChannelScanner:
                         "items": items_sorted,
                         "keep": items_sorted[0],
                         "dups": items_sorted[1:],
-                        "reason": "مدت ~۱ث + حجم ~۳۰MB (چک کن)",
+                        "reason": "حجم+مدت نزدیک",
                     })
                     used.update(group_idx)
 
@@ -628,16 +610,14 @@ class ChannelScanner:
 
         # ---------- دیباگ وقتی چیزی پیدا نشد ----------
         if not sure_groups and not suspect_groups:
-            parts = []
-            # نمونه داده (۳ تا اول)
-            parts.append("\n\n🔍 دیباگ — نمونه فایل‌های ثبت‌شده:")
-            for r in rows[:3]:
+            parts = ["\n\n🔍 دیباگ — نمونه فایل‌های ثبت‌شده (از ۵۰۰ اول):"]
+            sample = rows[:500]
+            for r in sample[:3]:
                 nm = (r["filename"] or "بدون اسم")[:30]
                 mb = int(r["size"] or 0) / (1024 * 1024)
                 dr = float(r["duration"] or 0)
                 parts.append(f"• `{nm}` | {mb:.0f}MB | {int(dr // 60)}:{int(dr % 60):02d}")
-            # نزدیک‌ترین جفت‌ها (نمونه ۵۰۰ تای اول)
-            sample = rows[:500]
+            # نزدیک‌ترین جفت‌ها بر اساس (حجم + مدت)
             pairs = []
             for i in range(len(sample)):
                 for j in range(i + 1, min(i + 50, len(sample))):
@@ -647,14 +627,14 @@ class ChannelScanner:
                     if da <= 0 or db_ <= 0 or sa <= 0 or sb <= 0:
                         continue
                     dd = abs(da - db_)
-                    ratio = max(sa, sb) / min(sa, sb)
-                    pairs.append((dd + (ratio - 1) * 60, a, b, dd, ratio))
+                    ds = abs(sa - sb) / (1024 * 1024)
+                    pairs.append((dd + ds, a, b, dd, ds))
             pairs.sort(key=lambda x: x[0])
-            parts.append("\nنزدیک‌ترین جفت‌ها (از ۵۰۰ نمونه):")
-            for score, a, b, dd, ratio in pairs[:5]:
+            parts.append("\nنزدیک‌ترین جفت‌ها (حجم+مدت):")
+            for score, a, b, dd, ds in pairs[:5]:
                 na = (a["filename"] or "بدون اسم")[:20]
                 nb = (b["filename"] or "بدون اسم")[:20]
-                parts.append(f"• `{na}` vs `{nb}` | Δمدت={dd:.1f}s | نسبت حجم={ratio:.2f}")
+                parts.append(f"• `{na}` vs `{nb}` | Δمدت={dd:.1f}s | Δحجم={ds:.0f}MB")
             debug = "\n".join(parts)
 
         return {"sure": sure_groups, "suspect": suspect_groups, "debug": debug}

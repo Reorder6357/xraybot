@@ -37,6 +37,17 @@ class Database:
                 added_at REAL
             );
 
+            -- نتیجه آخرین اسکن هر کانال (تا دوباره اسکن نشه)
+            CREATE TABLE IF NOT EXISTS scan_results (
+                channel_id TEXT PRIMARY KEY,
+                scanned_at REAL,
+                files_count INTEGER DEFAULT 0,
+                sure_count INTEGER DEFAULT 0,
+                suspect_count INTEGER DEFAULT 0,
+                groups_json TEXT,
+                debug TEXT
+            );
+
             -- فایل‌های اسکن‌شده در کانال (برای تشخیص تکراری)
             CREATE TABLE IF NOT EXISTS scanned_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +112,39 @@ class Database:
             "SELECT * FROM channels WHERE chat_id = ?", (str(chat_id),)
         )
         return await cur.fetchone()
+
+    # ---------- scan results (نتیجه اسکن ذخیره‌شده) ----------
+    async def save_scan_result(self, channel_id: str, files_count: int, found: dict):
+        import json as _json
+        await self._conn.execute(
+            """
+            INSERT OR REPLACE INTO scan_results
+                (channel_id, scanned_at, files_count, sure_count, suspect_count, groups_json, debug)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel_id, time.time(), int(files_count),
+                len(found.get("sure") or []), len(found.get("suspect") or []),
+                _json.dumps(found, ensure_ascii=False, default=str),
+                found.get("debug") or "",
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_scan_result(self, channel_id: str):
+        cur = await self._conn.execute(
+            "SELECT * FROM scan_results WHERE channel_id = ?", (channel_id,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        import json as _json
+        result = dict(row)
+        try:
+            result["groups"] = _json.loads(result.get("groups_json") or "{}")
+        except Exception:
+            result["groups"] = {}
+        return result
 
     # ---------- scanned files (اسکن کانال) ----------
     async def add_scanned_files(self, channel_id: str, items: list[dict]):
